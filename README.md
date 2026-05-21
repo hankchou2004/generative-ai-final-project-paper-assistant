@@ -52,13 +52,15 @@ https://github.com/JerryYin777/PaperHelper
 
 ## Demo
 
-### 系統介面
+## 📸 系統展示
 
-> 可在此放置系統截圖
+### 🏠 主介面
+![demo1](image/demo1.png)
 
-```markdown
-![demo](image/demo.png)
-```
+---
+
+### 💬 問答介面
+![demo2](image/demo2.png)
 
 ---
 
