@@ -1,4 +1,4 @@
-# PaperHelper
+# 生成式ai期末專案-智慧論文助手
 
 一個基於 RAG（Retrieval-Augmented Generation）的論文閱讀助手，能協助使用者針對學術論文進行問答、檢索相關內容，並提供較可靠的參考依據。
 
