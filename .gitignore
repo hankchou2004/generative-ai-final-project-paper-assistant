@@ -1,4 +1,11 @@
-__pycache__
+__pycache__/
+*.pyc
+.env
+venv/
+.env.local
+*.ipynb_checkpoints
+chromadb/
+faiss_index/__pycache__
 .idea
 .streamlit/secrets.toml
 *.pkl

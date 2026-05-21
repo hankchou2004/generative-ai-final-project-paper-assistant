@@ -1,8 +1,31 @@
-langchain
-openai
-streamlit
-faiss-cpu
-tiktoken
-langchainhub
-pypdf
+# Core LangChain (v0.2+)
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-google-genai>=1.0.0
+langchain-core>=0.2.0
+
+# Google AI Studio
+google-generativeai>=0.5.0
+
+# Streamlit
+streamlit>=1.35.0
+
+# PDF processing
+pypdf>=4.0.0
+pdfplumber>=0.10.0       # text + table extraction
+pypdfium2>=5.0.0         # page rasterization (no external deps)
+pdf2image>=1.16.0        # optional alternative rasterizer (needs poppler)
+Pillow>=10.0.0           # image handling
+
+# OCR fallback
+pytesseract>=0.3.10      # needs: apt install tesseract-ocr tesseract-ocr-chi-tra
+
+# Vector store
+faiss-cpu>=1.8.0
+
+# Retry
+tenacity>=8.0.0
+
+# arXiv downloader
 arxiv-downloader
+tiktoken
