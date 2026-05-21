@@ -1,76 +1,163 @@
-## PaperHelper: Knowledge-Based LLM QA Paper Reading Assistant with Reliable References
+# PaperHelper
 
-### [1] Introduction
+一個基於 RAG（Retrieval-Augmented Generation）的論文閱讀助手，能協助使用者針對學術論文進行問答、檢索相關內容，並提供較可靠的參考依據。
 
-Thanks to the Great [Ms. Freax](https://github.com/H-Freax) for designing the [Athenas-Oracle project](https://github.com/H-Freax/Athenas-Oracle). 
+---
 
-Based on it, we have made improvements and designed the Paper Helper for Machine Learning Scientists. With the effects of RAG Fusion and RAFT (RAG Finetune, fine-tuned using GPT-4-1106-Preview API on the 52,000 [MLArxivPapers](https://huggingface.co/datasets/CShorten/ML-ArXiv-Papers) and [ArxivQA](https://huggingface.co/datasets/arxiv-community/arxiv_dataset) dataset as the backend), it can effectively reduce hallucinations and enhance retrieval relevance. We have implemented an end-to-end application of parallel generating, providing useful information to paper readers based on references ranked by relevance. We also incorporated structural relationships to represent the extracted information. 
+## 專案介紹
 
-In short, everything is designed to enable a machine learning researcher to read papers more efficiently and provide the most reliable references based on paper citations!
+本專案是基於原始的 PaperHelper 專案進行修改與延伸開發：
 
-### [2] Implementation Details
+Original Project：
+https://github.com/JerryYin777/PaperHelper
 
-### Overview
-The assistant utilizes three tools: search, gather evidence, and answer questions. These tools enable it to find and parse relevant full-text research papers, identify specific sections in the paper that help answer the question, summarize those sections with the context of the question (called evidence), and then generate an answer based on the evidence. It is an agent so that the LLMs orchestrating the tools can adjust the input to paper searches, gather evidence with different phrases, and assess if an answer is complete. 
-<div align=center>
-	<img src="https://github.com/JerryYin777/PaperHelper/assets/88324880/a66103ea-58ed-4daa-b56e-8f5615f816c5"/>
-</div>
+在原有架構基礎上，我針對自己的研究與學習需求進行調整與功能擴充，包含：
 
-### Basic RAG
-The basic RAG simply splits the search prompt into simple words in a crude manner, and may produce certain spelling illusions without truly understanding the user's intent.
-![Basic RAG](https://github.com/JerryYin777/PaperHelper/assets/88324880/3a39564d-3cbf-49c5-b5ae-7f0888d40039)
+- PDF 論文嵌入與向量化
+- RAG Fusion 檢索方式
+- Gemini / OpenAI API 整合
+- 論文問答功能
+- 回答評估與分數分析頁面
+- Streamlit 網頁介面
+- 參考內容檢索與生成
 
-### RAG Fusion with RAFT
-Our system also has integrated the [RAFT](https://arxiv.org/pdf/2403.10131) method. This approach enhances the capability of LLMs in specific RAG tasks by leveraging the core idea that if LLMs can "learn" documents in advance, it can improve RAG's performance. 
+本系統透過 Retrieval-Augmented Generation（RAG）技術，降低大型語言模型產生幻覺（Hallucination）的情況，並提升回答與論文內容的相關性。
 
-We finetuned the OpenAI API using 52,000 domain-specific papers from the field of machine learning to augment the knowledge of PaperHelper within the machine learning domain, thereby assisting machine learning scientists in reading papers more efficiently and accurately.
+---
 
-<div align=center>
-	<img src="https://github.com/JerryYin777/PaperHelper/assets/88324880/85816fc0-487a-4460-ad8c-a82c9d8ff323"/>
-</div>
+## 功能特色
 
-### Extract Relevance
-With the implementation of RAFT, we can extract the reference section at the end of articles more efficiently. First, we use RAG to traverse all the references in the article. Then, based on the knowledge from the LLMs, we refine the information using the top-k algorithm to identify the literature most relevant to the article.
+- 上傳並解析 PDF 論文
+- 論文內容向量化與語意搜尋
+- RAG 問答系統
+- RAG Fusion 檢索
+- 顯示相關參考內容
+- Streamlit 互動介面
+- 回答品質評估功能
 
-<div align=center>
-	<img src="https://github.com/JerryYin777/PaperHelper/assets/88324880/c5b232cb-b236-4d4e-8b21-860749b64ca1"/>
-</div>
+---
 
-We can find that through the RAFT method, the model integrates cutting-edge knowledge, enabling readers to further explore academic papers based on current information rather than providing outdated and misleading content.
+## 系統流程
 
-<div align=center>
-	<img src="https://github.com/JerryYin777/PaperHelper/assets/88324880/e535614f-f07e-4107-aeed-01e63dae66fb"/>
-</div>
+系統主要流程如下：
 
-### [3] Usage
-Use the following command step by step:
-1. **Clone the Repository**
-```bash
-git clone https://github.com/JerryYin777/PaperHelper.git
+1. 載入 PDF 論文
+2. 文字切割（Text Chunking）
+3. Embedding 向量生成
+4. 建立向量資料庫（FAISS / ChromaDB）
+5. 使用 RAG 或 RAG Fusion 進行檢索
+6. 將檢索結果交給 LLM 生成回答
+
+---
+
+## Demo
+
+### 系統介面
+
+> 可在此放置系統截圖
+
+```markdown
+![demo](image/demo.png)
 ```
-2. **Install Dependencies**
+
+---
+
+## 專案結構
+
+```text
+PaperHelper/
+│
+├── app.py                  # Streamlit 主程式
+├── embed_pdf.py            # PDF embedding 與向量化
+├── llm_helper.py           # LLM 問答處理
+├── agent_helper.py         # Retrieval / Agent logic
+├── eval_page.py            # 回答評估頁面
+├── requirements.txt
+├── README.md
+└── pdf/                    # PDF 論文資料夾
+```
+
+---
+
+## 安裝方式
+
+### 1. Clone 專案
+
 ```bash
-cd PaperHelper
+git clone https://github.com/hankchou2004/paper-helper.git
+cd paper-helper
+```
+
+### 2. 安裝套件
+
+```bash
 pip install -r requirements.txt
 ```
-3. **Set OpenAI API Key**
-```bash
-cd .streamlit
-touch secrets.toml #input your OPENAI_API_KEY = "sk-yourapikeyhere" here
+
+### 3. 設定 API Key
+
+建立 `.streamlit/secrets.toml`
+
+```toml
+OPENAI_API_KEY="your_api_key"
+GOOGLE_API_KEY="your_api_key"
 ```
-4. **Start PaperHelper**
+
+### 4. 啟動系統
+
 ```bash
 streamlit run app.py
 ```
-**Note:** 
-1. Set `allow_dangerous_deserialization: bool = True` first, where you can find in `faiss.py`.
 
-<div align=center>
-	<img src="https://github.com/JerryYin777/PaperHelper/assets/88324880/2669ad40-e3c5-4a48-b393-4ffdb4709231"/>
-</div>
+---
 
-2. You may also embed your pdf first in the application (click the button), or you may raise error `Exceptation: Directory index does not exist.`
+## 使用方式
 
+1. 上傳 PDF 論文
+2. 建立 Embedding
+3. 選擇 RAG 或 RAG Fusion
+4. 輸入問題
+5. 系統回傳回答與相關參考內容
 
+---
 
+## 技術使用
 
+- Python
+- Streamlit
+- LangChain
+- FAISS
+- ChromaDB
+- OpenAI API
+- Google Gemini API
+- Sentence Transformers
+
+---
+
+## 評估方式
+
+本系統提供回答品質評估功能，包含：
+
+- ROUGE Score
+- BLEU Score
+- BERTScore
+- Exact Match
+
+可用於分析 RAG 回答品質與檢索效果。
+
+---
+
+## 注意事項
+
+- 請自行設定 API Key
+- 不建議將 `.env` 或 `secrets.toml` 上傳至 GitHub
+- 首次建立 embedding 可能需要較長時間
+- 建議先完成 PDF embedding 再進行問答
+
+---
+
+## Reference
+
+Original PaperHelper Project：
+
+https://github.com/JerryYin777/PaperHelper
