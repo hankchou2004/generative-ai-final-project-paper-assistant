@@ -72,9 +72,13 @@ PaperHelper/
 ├── llm_helper.py           # LLM 問答處理
 ├── agent_helper.py         # Retrieval / Agent logic
 ├── eval_page.py            # 回答評估頁面
-├── requirements.txt
+├── requirements.txt        # 套件版本
 ├── README.md
-└── pdf/                    # PDF 論文資料夾
+│
+├── pdf/                    # PDF 論文資料夾
+│
+└── .streamlit/            # Streamlit 設定資料夾
+    └── config.toml        # api設定
 ```
 
 ---
