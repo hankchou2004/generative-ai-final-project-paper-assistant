@@ -15,7 +15,7 @@ https://github.com/JerryYin777/PaperHelper
 
 - PDF 論文嵌入與向量化
 - RAG Fusion 檢索方式
-- Gemini / OpenAI API 整合
+- Gemini / Groq (Llama)
 - 論文問答功能
 - 回答評估與分數分析頁面
 - Streamlit 網頁介面
@@ -150,7 +150,6 @@ streamlit run app.py
 ## 注意事項
 
 - 請自行設定 API Key
-- 不建議將 `.env` 或 `secrets.toml` 上傳至 GitHub
 - 首次建立 embedding 可能需要較長時間
 - 建議先完成 PDF embedding 再進行問答
 
