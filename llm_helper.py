@@ -7,6 +7,7 @@ Supports multiple providers: Google Gemini / Groq
 
 import os
 import logging
+import re
 from typing import List
 
 logger = logging.getLogger("llm_helper")
@@ -238,51 +239,6 @@ def get_search_query_generation_chain(provider: str = None):
     )
 
 
-# ── RAG Chain (multi-file) ────────────────────────────────────────────────────
-
-def get_rag_chain_files(
-    file_names: List[str],
-    index_folder: str = "index",
-    retrieval_cb=None,
-    provider: str = None,
-):
-    """基本 RAG 鏈（多檔案）。"""
-    p = provider or LLM_PROVIDER
-    logger.info(f"[get_rag_chain_files] provider={p}, 檔案: {file_names}")
-    vectorstores = get_search_index(file_names, index_folder, provider=p)
-
-    if retrieval_cb is None:
-        retrieval_cb = lambda x: x
-
-    def multi_retrieve(query: str) -> str:
-        docs = []
-        for vs in vectorstores:
-            docs.extend(vs.as_retriever(search_kwargs={"k": 5}).invoke(query))
-        return format_docs(docs)
-
-    _inputs = RunnableMap(
-        standalone_question=RunnablePassthrough.assign(
-            chat_history=lambda x: _format_chat_history(x["chat_history"])
-        )
-        | CONDENSE_QUESTION_PROMPT
-        | get_llm(temperature=0, provider=p)
-        | StrOutputParser(),
-    )
-
-    _context = {
-        "context": (
-            itemgetter("standalone_question")
-            | RunnablePassthrough(func=retrieval_cb)
-            | multi_retrieve
-        ),
-        "question": lambda x: x["standalone_question"],
-    }
-
-    chain = _inputs | _context | ANSWER_PROMPT | get_llm(provider=p)
-    logger.info("[get_rag_chain_files] RAG 鏈建立完成")
-    return chain
-
-
 # ── RAG Fusion Chain (multi-file) ─────────────────────────────────────────────
 
 def get_rag_fusion_chain_files(
@@ -331,4 +287,171 @@ def get_rag_fusion_chain_files(
 
     chain = _inputs | _context | ANSWER_PROMPT | get_llm(provider=p)
     logger.info("[get_rag_fusion_chain_files] RAG Fusion 鏈建立完成")
+    return chain
+
+
+# ── RAG Fusion + FLARE Chain (multi-file) ────────────────────────────────────
+#
+#  FLARE (Forward-Looking Active REtrieval augmented generation) 核心流程：
+#  FLARE core flow:
+#
+#  1. 用 RAG Fusion 取得初步上下文，生成初稿答案（draft）
+#  2. 掃描初稿中低信心句子（含 [UNCERTAIN] 標記 或 以 "I'm not sure" 起頭）
+#  3. 針對每個低信心句子，以 RAG Fusion 再次檢索更多證據
+#  4. 將補充上下文注入，重新生成最終答案
+#
+#  此實作為「輕量版 FLARE」：
+#  - 不依賴 token-level log-probability（LangChain API 限制）
+#  - 改以 LLM 顯式標記不確定語句，迭代最多 MAX_FLARE_ITER 輪
+# ─────────────────────────────────────────────────────────────────────────────
+
+MAX_FLARE_ITER = 2   # 最多補充檢索輪數
+
+_flare_draft_template = """\
+你是一位論文分析助手。請根據以下文件內容，嘗試回答問題。
+You are a paper analysis assistant. Answer the question based on the context below.
+
+如果某個論述你不確定或文件中資訊不足，請在該句子**前面**加上標記 [UNCERTAIN]。
+If you are uncertain about a statement or the context is insufficient, prefix that sentence with [UNCERTAIN].
+
+{context}
+
+Question: {question}
+
+Draft Answer (mark uncertain sentences with [UNCERTAIN]):"""
+
+_flare_refine_template = """\
+你是一位論文分析助手。以下是初稿答案與補充檢索到的新文件。
+You are a paper analysis assistant. Below is a draft answer and additional retrieved documents.
+
+請根據新文件修正初稿中標記為 [UNCERTAIN] 的部分，去除 [UNCERTAIN] 標記，輸出最終完整答案。
+Revise the [UNCERTAIN] parts using the new context. Remove all [UNCERTAIN] markers and output the final polished answer.
+
+Original Question: {question}
+
+Draft Answer:
+{draft}
+
+Additional Context:
+{extra_context}
+
+Final Answer (no [UNCERTAIN] markers, cite page numbers [p.X]):"""
+
+_FLARE_DRAFT_PROMPT  = ChatPromptTemplate.from_template(_flare_draft_template)
+_FLARE_REFINE_PROMPT = ChatPromptTemplate.from_template(_flare_refine_template)
+
+_UNCERTAIN_RE = re.compile(r"\[UNCERTAIN\](.+?)(?=\[UNCERTAIN\]|$)", re.DOTALL)
+
+
+def _extract_uncertain_sentences(draft: str) -> List[str]:
+    """擷取草稿中所有 [UNCERTAIN] 標記的句子作為補充查詢。"""
+    matches = _UNCERTAIN_RE.findall(draft)
+    queries = [m.strip()[:200] for m in matches if m.strip()]
+    logger.debug(f"[FLARE] 不確定句子數: {len(queries)}")
+    return queries
+
+
+def get_rag_fusion_flare_chain_files(
+    file_names: List[str],
+    index_folder: str = "index",
+    retrieval_cb=None,
+    flare_cb=None,
+    provider: str = None,
+):
+    """
+    RAG Fusion + FLARE 鏈（多檔案）。
+    RAG Fusion + FLARE chain (multi-file).
+
+    Args:
+        file_names:   FAISS 索引名稱列表
+        index_folder: 索引目錄
+        retrieval_cb: 初次檢索回調（顯示 sub-queries）
+        flare_cb:     FLARE 補充檢索回調（顯示不確定句子查詢）
+        provider:     "google" | "groq"
+    """
+    p = provider or LLM_PROVIDER
+    logger.info(f"[get_rag_fusion_flare_chain_files] provider={p}, 檔案: {file_names}")
+    vectorstores = get_search_index(file_names, index_folder, provider=p)
+    query_gen_chain = get_search_query_generation_chain(provider=p)
+    llm = get_llm(temperature=0, provider=p)
+
+    if retrieval_cb is None:
+        retrieval_cb = lambda x: x
+    if flare_cb is None:
+        flare_cb = lambda x: x
+
+    def _multi_retrieve_raw(queries: List[str]) -> List:
+        """多查詢 RRF 檢索，回傳 Document 列表。"""
+        all_docs = []
+        for query in queries:
+            per_q = []
+            for vs in vectorstores:
+                per_q.extend(vs.as_retriever(search_kwargs={"k": 5}).invoke(query))
+            all_docs.append(per_q)
+        fused = reciprocal_rank_fusion(all_docs)
+        return [doc for doc, _ in fused]
+
+    def _retrieve_and_fuse_text(queries: List[str]) -> str:
+        docs = _multi_retrieve_raw(queries)
+        return format_docs(docs)
+
+    def run_flare(inputs: dict) -> str:
+        """
+        完整 FLARE 推論流程（同步，可 stream 最終答案由呼叫端處理）。
+        Returns the final answer string.
+        """
+        question = inputs["standalone_question"]
+
+        # ── Step 1: RAG Fusion 初次檢索 ───────────────────────
+        sub_queries = query_gen_chain.invoke({"original_query": question})
+        retrieval_cb(sub_queries)           # 通知 UI 顯示子查詢
+        context = _retrieve_and_fuse_text(sub_queries)
+
+        # ── Step 2: 生成草稿（含 [UNCERTAIN] 標記）────────────
+        draft_msg = _FLARE_DRAFT_PROMPT.format_messages(
+            context=context, question=question
+        )
+        draft_resp = llm.invoke(draft_msg)
+        draft = draft_resp.content.strip()
+        logger.debug(f"[FLARE] 初稿 (前 300 字): {draft[:300]}")
+
+        # ── Step 3: 迭代補充檢索 ──────────────────────────────
+        for iteration in range(MAX_FLARE_ITER):
+            uncertain_sents = _extract_uncertain_sentences(draft)
+            if not uncertain_sents:
+                logger.info(f"[FLARE] 第 {iteration+1} 輪：無不確定句子，停止迭代")
+                break
+
+            logger.info(f"[FLARE] 第 {iteration+1} 輪補充檢索，查詢數: {len(uncertain_sents)}")
+            flare_cb(uncertain_sents)       # 通知 UI 顯示補充查詢
+
+            extra_docs = _multi_retrieve_raw(uncertain_sents)
+            extra_context = format_docs(extra_docs)
+
+            refine_msg = _FLARE_REFINE_PROMPT.format_messages(
+                question=question,
+                draft=draft,
+                extra_context=extra_context,
+            )
+            refined_resp = llm.invoke(refine_msg)
+            draft = refined_resp.content.strip()
+            logger.debug(f"[FLARE] 第 {iteration+1} 輪精煉後 (前 300 字): {draft[:300]}")
+
+        return draft
+
+    # 建立 Runnable 包裝，讓 .stream() 可正常呼叫
+    from langchain_core.runnables import RunnableLambda
+
+    _inputs = RunnableMap(
+        standalone_question=RunnablePassthrough.assign(
+            chat_history=lambda x: _format_chat_history(x["chat_history"])
+        )
+        | CONDENSE_QUESTION_PROMPT
+        | get_llm(temperature=0, provider=p)
+        | StrOutputParser(),
+    )
+
+    flare_runnable = RunnableLambda(run_flare)
+    chain = _inputs | flare_runnable
+    logger.info("[get_rag_fusion_flare_chain_files] RAG Fusion + FLARE 鏈建立完成")
     return chain

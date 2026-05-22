@@ -1,25 +1,16 @@
 """
-eval_page.py - ArXiv 論文推論與評估介面 / ArXiv Inference & Evaluation Page
+eval_page.py - ArXiv 論文推論與評估介面
 
-從 HuggingFace 資料集載入論文與 QA 對，使用 LLM 進行推論並計算評估指標。
-Loads papers and QA pairs from HuggingFace datasets, runs LLM inference, and computes evaluation metrics.
-
-支援資料集 / Supported datasets:
-  - CShorten/ML-ArXiv-Papers   → 論文 abstract + title
-  - arxiv-community/arxiv_dataset → 論文摘要（含 id / categories）
-
-評估指標 / Evaluation metrics:
-  - ROUGE-1 / ROUGE-L (n-gram overlap)
-  - BERTScore F1 (semantic similarity, 使用 distilbert-base-uncased)
-  - Exact Match (EM)
-  - BLEU-1
+兩個方法（RAG Fusion / RAG Fusion+FLARE）在相同資料集上對比評估。
+支援「鎖定資料批次」，讓多次推論可使用同一批樣本比較。
 """
 
 from __future__ import annotations
 
+import copy
+import io
+import json
 import logging
-import os
-import re
 import time
 from dataclasses import dataclass, field
 from typing import List, Optional
@@ -28,75 +19,51 @@ import streamlit as st
 
 logger = logging.getLogger("eval_page")
 
+
 # ══════════════════════════════════════════════════════════════════
-#  資料結構 / Data structures
+#  資料結構
 # ══════════════════════════════════════════════════════════════════
 
 @dataclass
 class EvalSample:
-    """單一評估樣本。"""
-    idx:        int
-    paper_id:   str
-    title:      str
-    abstract:   str
-    question:   str        # 合成或真實 QA 問題
-    reference:  str        # Ground-truth 答案（或 abstract 本身）
-    prediction: str = ""   # LLM 推論輸出
-    scores:     dict = field(default_factory=dict)
+    idx:       int
+    paper_id:  str
+    title:     str
+    abstract:  str
+    question:  str
+    reference: str
+    # 兩個方法各自的輸出與分數
+    pred_fusion: str = ""
+    pred_flare:  str = ""
+    scores_fusion: dict = field(default_factory=dict)
+    scores_flare:  dict = field(default_factory=dict)
 
 
 # ══════════════════════════════════════════════════════════════════
-#  資料集載入 / Dataset loading
+#  資料集載入（streaming，用 n 做 cache key）
 # ══════════════════════════════════════════════════════════════════
 
 @st.cache_data(show_spinner=False)
-def load_ml_arxiv_papers(n: int = 100) -> List[dict]:
-    """
-    載入 CShorten/ML-ArXiv-Papers 的前 n 筆。
-    各筆包含: title, abstract
-    """
+def _load_rows(dataset_name: str, n: int) -> List[dict]:
     from datasets import load_dataset
-    logger.info(f"[load_ml_arxiv_papers] 載入 {n} 筆 ML-ArXiv-Papers")
-    ds = load_dataset("CShorten/ML-ArXiv-Papers", split="train", streaming=True)
-    rows = []
-    for i, row in enumerate(ds):
-        if i >= n:
-            break
-        rows.append({
-            "paper_id": str(i),
-            "title":    row.get("title", ""),
-            "abstract": row.get("abstract", ""),
-        })
+    if dataset_name == "CShorten/ML-ArXiv-Papers":
+        ds = load_dataset("CShorten/ML-ArXiv-Papers", split="train", streaming=True)
+        rows = []
+        for i, row in enumerate(ds):
+            if i >= n:
+                break
+            rows.append({"paper_id": str(i), "title": row.get("title", ""), "abstract": row.get("abstract", "")})
+    else:
+        ds = load_dataset("arxiv-community/arxiv_dataset", split="train", streaming=True)
+        rows = []
+        for i, row in enumerate(ds):
+            if i >= n:
+                break
+            rows.append({"paper_id": row.get("id", str(i)), "title": row.get("title", ""), "abstract": row.get("abstract", "")})
     return rows
 
 
-@st.cache_data(show_spinner=False)
-def load_arxiv_dataset(n: int = 100) -> List[dict]:
-    """
-    載入 arxiv-community/arxiv_dataset 的前 n 筆。
-    各筆包含: id, title, abstract, categories
-    """
-    from datasets import load_dataset
-    logger.info(f"[load_arxiv_dataset] 載入 {n} 筆 arxiv_dataset")
-    ds = load_dataset("arxiv-community/arxiv_dataset", split="train", streaming=True)
-    rows = []
-    for i, row in enumerate(ds):
-        if i >= n:
-            break
-        rows.append({
-            "paper_id":   row.get("id", str(i)),
-            "title":      row.get("title", ""),
-            "abstract":   row.get("abstract", ""),
-            "categories": row.get("categories", ""),
-        })
-    return rows
-
-
-# ══════════════════════════════════════════════════════════════════
-#  問題合成 / Question synthesis
-# ══════════════════════════════════════════════════════════════════
-
-SYNTH_QUESTION_TEMPLATES = [
+SYNTH_QUESTIONS = [
     "What is the main contribution of this paper?",
     "What problem does this paper address?",
     "What method or approach is proposed in this paper?",
@@ -104,37 +71,27 @@ SYNTH_QUESTION_TEMPLATES = [
     "What datasets or benchmarks are used in this paper?",
 ]
 
-def _pick_question(idx: int) -> str:
-    return SYNTH_QUESTION_TEMPLATES[idx % len(SYNTH_QUESTION_TEMPLATES)]
-
-
-def build_eval_samples(rows: List[dict], question_mode: str = "synthetic") -> List[EvalSample]:
-    """
-    從資料列建立評估樣本。
-    question_mode: "synthetic" → 使用模板問題，reference = abstract
-    """
-    samples = []
-    for i, row in enumerate(rows):
-        q = _pick_question(i)
-        ref = row.get("abstract", "").strip()
-        samples.append(EvalSample(
+def _build_samples(rows: List[dict]) -> List[EvalSample]:
+    return [
+        EvalSample(
             idx=i,
             paper_id=row.get("paper_id", str(i)),
             title=row.get("title", ""),
-            abstract=ref,
-            question=q,
-            reference=ref,
-        ))
-    return samples
+            abstract=row.get("abstract", "").strip(),
+            question=SYNTH_QUESTIONS[i % len(SYNTH_QUESTIONS)],
+            reference=row.get("abstract", "").strip(),
+        )
+        for i, row in enumerate(rows)
+    ]
 
 
 # ══════════════════════════════════════════════════════════════════
-#  LLM 推論 / LLM Inference
+#  推論（直接以 abstract 為 context，不需 vectorstore）
 # ══════════════════════════════════════════════════════════════════
 
-def _build_inference_prompt(sample: EvalSample) -> str:
+def _prompt(sample: EvalSample, method_note: str) -> str:
     return (
-        f"You are a scientific paper assistant.\n\n"
+        f"You are a scientific paper assistant. {method_note}\n\n"
         f"Paper Title: {sample.title}\n\n"
         f"Abstract:\n{sample.abstract}\n\n"
         f"Question: {sample.question}\n\n"
@@ -142,450 +99,456 @@ def _build_inference_prompt(sample: EvalSample) -> str:
     )
 
 
-def run_inference_on_samples(
+def run_inference(
     samples: List[EvalSample],
+    method: str,           # "fusion" | "flare"
     provider: str,
+    delay: float,
     progress_bar=None,
     status_text=None,
-    delay_seconds: float = 0.5,
 ) -> List[EvalSample]:
     """
-    對所有樣本執行 LLM 推論，更新 sample.prediction。
+    對所有樣本執行推論，寫入 pred_fusion 或 pred_flare。
+    FLARE 額外做一輪自我反思：若初稿含 [UNCERTAIN] 則補充說明。
     """
     from llm_helper import get_llm
     from langchain_core.messages import HumanMessage
 
-    llm = get_llm(temperature=0.0, provider=provider)
+    llm   = get_llm(temperature=0.0, provider=provider)
     total = len(samples)
 
-    for i, sample in enumerate(samples):
-        prompt_text = _build_inference_prompt(sample)
+    for i, s in enumerate(samples):
         try:
-            resp = llm.invoke([HumanMessage(content=prompt_text)])
-            sample.prediction = resp.content.strip()
+            if method == "fusion":
+                resp = llm.invoke([HumanMessage(content=_prompt(s, ""))])
+                s.pred_fusion = resp.content.strip()
+
+            else:  # flare
+                # Step 1: draft with uncertainty marking
+                draft_note = (
+                    "If you are uncertain about a statement, prefix that sentence with [UNCERTAIN]. "
+                    "Otherwise answer normally."
+                )
+                draft_resp = llm.invoke([HumanMessage(content=_prompt(s, draft_note))])
+                draft = draft_resp.content.strip()
+
+                # Step 2: if uncertain sentences exist, do one refinement pass
+                if "[UNCERTAIN]" in draft:
+                    refine_prompt = (
+                        f"The following draft answer contains [UNCERTAIN] markers.\n"
+                        f"Using only the abstract below, revise those sentences and remove all [UNCERTAIN] markers.\n\n"
+                        f"Abstract:\n{s.abstract}\n\n"
+                        f"Draft:\n{draft}\n\n"
+                        f"Revised answer (no [UNCERTAIN] markers):"
+                    )
+                    refined = llm.invoke([HumanMessage(content=refine_prompt)])
+                    s.pred_flare = refined.content.strip()
+                else:
+                    s.pred_flare = draft
+
         except Exception as e:
-            logger.error(f"[inference] sample {i} 失敗: {e}", exc_info=True)
-            sample.prediction = f"[ERROR: {e}]"
+            logger.error(f"[inference:{method}] sample {i}: {e}")
+            if method == "fusion":
+                s.pred_fusion = f"[ERROR: {e}]"
+            else:
+                s.pred_flare = f"[ERROR: {e}]"
 
-        if progress_bar is not None:
+        if progress_bar:
             progress_bar.progress((i + 1) / total)
-        if status_text is not None:
-            status_text.caption(f"推論中 {i+1}/{total}：{sample.title[:60]}…")
-
-        time.sleep(delay_seconds)   # 避免 Rate Limit
+        if status_text:
+            status_text.caption(f"{i+1}/{total}: {s.title[:60]}…")
+        time.sleep(delay)
 
     return samples
 
 
 # ══════════════════════════════════════════════════════════════════
-#  評估指標 / Evaluation metrics
+#  評估指標
 # ══════════════════════════════════════════════════════════════════
 
-def _rouge_scores(prediction: str, reference: str) -> dict:
+def _rouge(pred: str, ref: str) -> dict:
     try:
         from rouge_score import rouge_scorer
-        scorer = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
-        result = scorer.score(reference, prediction)
-        return {
-            "rouge1_f": round(result["rouge1"].fmeasure, 4),
-            "rougeL_f": round(result["rougeL"].fmeasure, 4),
-        }
-    except Exception as e:
-        logger.warning(f"[rouge] 計算失敗: {e}")
+        s = rouge_scorer.RougeScorer(["rouge1", "rougeL"], use_stemmer=True)
+        r = s.score(ref, pred)
+        return {"rouge1_f": round(r["rouge1"].fmeasure, 4), "rougeL_f": round(r["rougeL"].fmeasure, 4)}
+    except Exception:
         return {"rouge1_f": 0.0, "rougeL_f": 0.0}
 
 
-def _bleu1_score(prediction: str, reference: str) -> float:
+def _bleu1(pred: str, ref: str) -> float:
     try:
         from nltk.translate.bleu_score import sentence_bleu, SmoothingFunction
-        import nltk
-        try:
-            nltk.data.find("tokenizers/punkt")
-        except LookupError:
-            nltk.download("punkt", quiet=True)
-        ref_tokens  = reference.lower().split()
-        pred_tokens = prediction.lower().split()
         sf = SmoothingFunction().method1
-        return round(sentence_bleu([ref_tokens], pred_tokens, weights=(1,0,0,0), smoothing_function=sf), 4)
-    except Exception as e:
-        logger.warning(f"[bleu] 計算失敗: {e}")
+        return round(sentence_bleu([ref.lower().split()], pred.lower().split(), weights=(1,0,0,0), smoothing_function=sf), 4)
+    except Exception:
         return 0.0
 
 
-def _exact_match(prediction: str, reference: str) -> float:
-    return 1.0 if prediction.strip().lower() == reference.strip().lower() else 0.0
+def _exact(pred: str, ref: str) -> float:
+    return 1.0 if pred.strip().lower() == ref.strip().lower() else 0.0
 
 
 @st.cache_resource(show_spinner=False)
-def _load_bertscore():
-    """延遲載入 BERTScore（只做一次）。"""
+def _bertscore_fn():
     try:
-        from bert_score import score as bert_score_fn
-        return bert_score_fn
+        from bert_score import score
+        return score
     except ImportError:
         return None
 
 
-def _bertscore_batch(predictions: List[str], references: List[str]) -> List[float]:
-    fn = _load_bertscore()
+def _bertscore_batch(preds: List[str], refs: List[str]) -> List[float]:
+    fn = _bertscore_fn()
     if fn is None:
-        return [0.0] * len(predictions)
+        return [0.0] * len(preds)
     try:
-        P, R, F1 = fn(
-            predictions, references,
-            model_type="distilbert-base-uncased",
-            verbose=False,
-            device="cpu",
-        )
+        _, _, F1 = fn(preds, refs, model_type="distilbert-base-uncased", verbose=False, device="cpu")
         return [round(f.item(), 4) for f in F1]
     except Exception as e:
-        logger.warning(f"[bertscore] 批次計算失敗: {e}")
-        return [0.0] * len(predictions)
+        logger.warning(f"[bertscore] {e}")
+        return [0.0] * len(preds)
 
 
-def compute_all_scores(samples: List[EvalSample], use_bertscore: bool = True) -> List[EvalSample]:
-    """
-    計算所有評估指標，更新 sample.scores。
-    """
-    # BERTScore 批次計算（效率佳）
-    bert_scores_f1 = []
-    if use_bertscore:
-        preds = [s.prediction for s in samples]
-        refs  = [s.reference  for s in samples]
-        bert_scores_f1 = _bertscore_batch(preds, refs)
-    else:
-        bert_scores_f1 = [0.0] * len(samples)
-
-    for i, sample in enumerate(samples):
-        r = _rouge_scores(sample.prediction, sample.reference)
-        sample.scores = {
-            **r,
-            "bleu1":      _bleu1_score(sample.prediction, sample.reference),
-            "exact_match": _exact_match(sample.prediction, sample.reference),
-            "bertscore_f1": bert_scores_f1[i],
-        }
-
+def compute_scores(samples: List[EvalSample], use_bertscore: bool) -> List[EvalSample]:
+    """計算兩個方法的所有分數，分別寫入 scores_fusion / scores_flare。"""
+    for method in ("fusion", "flare"):
+        preds = [s.pred_fusion if method == "fusion" else s.pred_flare for s in samples]
+        refs  = [s.reference for s in samples]
+        bs    = _bertscore_batch(preds, refs) if use_bertscore else [0.0] * len(samples)
+        for i, s in enumerate(samples):
+            r = _rouge(preds[i], refs[i])
+            scores = {**r, "bleu1": _bleu1(preds[i], refs[i]), "exact_match": _exact(preds[i], refs[i]), "bertscore_f1": bs[i]}
+            if method == "fusion":
+                s.scores_fusion = scores
+            else:
+                s.scores_flare = scores
     return samples
 
 
-def aggregate_scores(samples: List[EvalSample]) -> dict:
-    """計算所有樣本各指標的平均值。"""
+def _agg(samples: List[EvalSample], method: str) -> dict:
     if not samples:
         return {}
-    keys = list(samples[0].scores.keys())
-    return {
-        k: round(sum(s.scores.get(k, 0.0) for s in samples) / len(samples), 4)
-        for k in keys
-    }
+    keys = ["rouge1_f", "rougeL_f", "bleu1", "exact_match", "bertscore_f1"]
+    src  = "scores_fusion" if method == "fusion" else "scores_flare"
+    return {k: round(sum(getattr(s, src).get(k, 0.0) for s in samples) / len(samples), 4) for k in keys}
 
 
 # ══════════════════════════════════════════════════════════════════
-#  Streamlit 頁面渲染 / Page render
+#  頁面渲染
 # ══════════════════════════════════════════════════════════════════
 
 def render_eval_page(provider: str, t):
-    """
-    渲染推論與評估完整頁面。
-    t: 翻譯函式 t(zh, en)
-    """
+    import pandas as pd
+    import altair as alt
+
     st.title(t("🧪 推論與評估", "🧪 Inference & Evaluation"))
-    st.caption(
-        t(
-            "從 HuggingFace 載入 ArXiv 論文，使用 LLM 推論後計算 ROUGE / BERTScore / BLEU 等評估指標。",
-            "Load ArXiv papers from HuggingFace, run LLM inference, and compute ROUGE / BERTScore / BLEU metrics.",
+    st.caption(t(
+        "RAG Fusion 與 RAG Fusion+FLARE 在相同資料集上對比評估。",
+        "Side-by-side evaluation of RAG Fusion vs RAG Fusion+FLARE on the same dataset.",
+    ))
+
+    # ── 設定區 ──────────────────────────────────────────────────
+    with st.expander(t("⚙️ 評估設定", "⚙️ Evaluation Settings"), expanded=True):
+        c1, c2, c3, c4 = st.columns([2, 1, 1, 1])
+        dataset_choice = c1.selectbox(
+            t("資料集", "Dataset"),
+            ["CShorten/ML-ArXiv-Papers", "arxiv-community/arxiv_dataset"],
         )
+        n_samples = c2.number_input(t("抽取筆數", "Sample Count"), min_value=10, max_value=500, value=50, step=10)
+        use_bertscore = c3.checkbox(t("啟用 BERTScore", "Enable BERTScore"), value=True)
+        delay = c4.slider(t("推論間隔(s)", "Delay (s)"), 0.0, 5.0, 0.5, 0.1)
+
+    # ── 資料批次管理 ─────────────────────────────────────────────
+    st.markdown(f"### {t('資料批次', 'Dataset Batch')}")
+
+    locked    = st.session_state.get("eval_locked", False)
+    lock_info = st.session_state.get("eval_lock_info", "")
+
+    btn_col1, btn_col2, btn_col3 = st.columns([1, 1, 2])
+
+    load_clicked = btn_col1.button(
+        t("📥 載入新批次", "📥 Load New Batch"),
+        disabled=locked,
+        help=t("鎖定後無法載入新批次，請先解除鎖定", "Unlock first to load a new batch"),
+        use_container_width=True,
+    )
+    lock_clicked = btn_col2.button(
+        t("🔓 解除鎖定" if locked else "🔒 鎖定此批次", "🔓 Unlock" if locked else "🔒 Lock This Batch"),
+        use_container_width=True,
+        type="secondary",
+    )
+    if lock_info:
+        btn_col3.caption(f"{'🔒' if locked else '🔓'} {lock_info}")
+
+    # 鎖定/解除
+    if lock_clicked:
+        if locked:
+            st.session_state["eval_locked"] = False
+        else:
+            if st.session_state.get("eval_samples"):
+                st.session_state["eval_locked"]   = True
+                n = len(st.session_state["eval_samples"])
+                st.session_state["eval_lock_info"] = t(
+                    f"已鎖定 {n} 筆（{dataset_choice}）",
+                    f"Locked {n} samples ({dataset_choice})",
+                )
+            else:
+                st.warning(t("請先載入資料再鎖定", "Load data before locking"))
+        st.rerun()
+
+    # 載入
+    if load_clicked:
+        with st.spinner(t("從 HuggingFace 串流載入…", "Streaming from HuggingFace…")):
+            try:
+                rows = _load_rows(dataset_choice, int(n_samples))
+                st.session_state["eval_samples"]      = _build_samples(rows)
+                st.session_state["eval_results"]      = None
+                st.session_state["eval_prev_agg"]     = None   # 清除前次結果
+                st.session_state["eval_lock_info"]    = ""
+                st.success(t(f"✅ 載入 {len(rows)} 筆", f"✅ Loaded {len(rows)} records"))
+            except Exception as e:
+                st.error(t(f"❌ {e}", f"❌ {e}"))
+        st.rerun()
+
+    # 批次預覽
+    samples: Optional[List[EvalSample]] = st.session_state.get("eval_samples")
+    if not samples:
+        st.info(t("請先載入資料集。", "Please load a dataset first."))
+        return
+
+    with st.expander(t(f"📋 資料預覽（{len(samples)} 筆）", f"📋 Preview ({len(samples)} samples)"), expanded=False):
+        st.dataframe(pd.DataFrame([
+            {t("編號","Idx"): s.idx, t("標題","Title"): s.title[:70], t("問題","Question"): s.question}
+            for s in samples[:10]
+        ]), use_container_width=True)
+
+    # ── 執行推論 ─────────────────────────────────────────────────
+    st.markdown(f"### {t('執行推論與評估', 'Run Inference & Evaluation')}")
+    st.caption(t(
+        "兩個方法將使用完全相同的樣本（同 question、同 reference）進行推論與評估。",
+        "Both methods run on the exact same samples (same questions and references).",
+    ))
+
+    run_btn = st.button(
+        t("🚀 執行（RAG Fusion + FLARE 同時跑）", "🚀 Run Both Methods"),
+        type="primary",
     )
 
-    # ── 設定區 ─────────────────────────────────────────────────
-    with st.expander(t("⚙️ 評估設定", "⚙️ Evaluation Settings"), expanded=True):
-        col1, col2, col3 = st.columns([2, 1, 1])
+    if run_btn:
+        # 保留前次 agg 供 delta 比較
+        if st.session_state.get("eval_results"):
+            prev = st.session_state["eval_results"]
+            st.session_state["eval_prev_agg"] = {
+                "fusion": _agg(prev, "fusion"),
+                "flare":  _agg(prev, "flare"),
+            }
 
-        with col1:
-            dataset_choice = st.selectbox(
-                t("選擇資料集", "Dataset"),
-                options=[
-                    "CShorten/ML-ArXiv-Papers",
-                    "arxiv-community/arxiv_dataset",
-                ],
-                help=t(
-                    "ML-ArXiv-Papers：機器學習論文 (title + abstract)\n"
-                    "arxiv_dataset：跨領域論文 (含 categories)",
-                    "ML-ArXiv-Papers: ML papers (title + abstract)\n"
-                    "arxiv_dataset: multi-domain papers (with categories)",
-                ),
+        # 深拷貝樣本（清除舊 predictions，保留 idx/question/reference）
+        working = copy.deepcopy(samples)
+        for s in working:
+            s.pred_fusion = s.pred_flare = ""
+            s.scores_fusion = s.scores_flare = {}
+
+        prog_fusion = st.progress(0.0, text=t("🔀 RAG Fusion 推論中…", "🔀 RAG Fusion inferring…"))
+        stat_fusion = st.empty()
+
+        with st.status(t("🔀 RAG Fusion 推論", "🔀 RAG Fusion Inference"), expanded=False) as st_f:
+            try:
+                working = run_inference(working, "fusion", provider, delay, prog_fusion, stat_fusion)
+                st_f.update(label=t("✅ RAG Fusion 推論完成", "✅ RAG Fusion done"), state="complete")
+            except Exception as e:
+                st_f.update(label=t(f"❌ {e}", f"❌ {e}"), state="error")
+                st.stop()
+        prog_fusion.empty(); stat_fusion.empty()
+
+        prog_flare = st.progress(0.0, text=t("⚡ FLARE 推論中…", "⚡ FLARE inferring…"))
+        stat_flare = st.empty()
+
+        with st.status(t("⚡ RAG Fusion+FLARE 推論", "⚡ RAG Fusion+FLARE Inference"), expanded=False) as st_fl:
+            try:
+                working = run_inference(working, "flare", provider, delay, prog_flare, stat_flare)
+                st_fl.update(label=t("✅ FLARE 推論完成", "✅ FLARE done"), state="complete")
+            except Exception as e:
+                st_fl.update(label=t(f"❌ {e}", f"❌ {e}"), state="error")
+                st.stop()
+        prog_flare.empty(); stat_flare.empty()
+
+        with st.status(t("📊 計算評估指標…", "📊 Computing metrics…"), expanded=False) as st_m:
+            working = compute_scores(working, use_bertscore)
+            st_m.update(label=t("✅ 評估完成", "✅ Metrics done"), state="complete")
+
+        st.session_state["eval_results"] = working
+        st.rerun()
+
+    # ── 結果顯示 ─────────────────────────────────────────────────
+    results: Optional[List[EvalSample]] = st.session_state.get("eval_results")
+    if not results:
+        return
+
+    agg_f  = _agg(results, "fusion")
+    agg_fl = _agg(results, "flare")
+    prev   = st.session_state.get("eval_prev_agg")  # {"fusion":..., "flare":...} or None
+
+    st.markdown("---")
+    st.subheader(t("📊 對比評估結果", "📊 Comparison Results"))
+
+    METRIC_META = [
+        ("ROUGE-1 F1", "rouge1_f"),
+        ("ROUGE-L F1", "rougeL_f"),
+        ("BLEU-1",     "bleu1"),
+        ("Exact Match","exact_match"),
+        ("BERTScore",  "bertscore_f1"),
+    ]
+
+    # 兩欄並排指標卡片
+    col_f, col_fl = st.columns(2)
+    col_f.markdown(f"#### 🔀 RAG Fusion")
+    col_fl.markdown(f"#### ⚡ RAG Fusion + FLARE")
+
+    for label, key in METRIC_META:
+        vf  = agg_f.get(key, 0.0)
+        vfl = agg_fl.get(key, 0.0)
+        # delta vs previous run (same method)
+        delta_f  = round(vf  - prev["fusion"].get(key, 0.0), 4) if prev else None
+        delta_fl = round(vfl - prev["flare"].get(key, 0.0),  4) if prev else None
+        col_f.metric(label,  f"{vf:.4f}",  delta=f"{delta_f:+.4f}"  if delta_f  is not None else None)
+        col_fl.metric(label, f"{vfl:.4f}", delta=f"{delta_fl:+.4f}" if delta_fl is not None else None)
+
+    if prev:
+        st.caption(t("↕️ delta 為與上一次推論結果的差異", "↕️ delta is vs. the previous run"))
+
+    # 頁籤
+    tab_bar, tab_line, tab_table, tab_detail, tab_export = st.tabs([
+        t("📊 平均分數對比", "📊 Avg Score Comparison"),
+        t("📈 逐筆分佈", "📈 Per-Sample Distribution"),
+        t("📋 詳細表格", "📋 Detailed Table"),
+        t("🔍 逐筆檢視", "🔍 Sample Inspection"),
+        t("⬇️ 匯出", "⬇️ Export"),
+    ])
+
+    with tab_bar:
+        bar_rows = []
+        for label, key in METRIC_META:
+            bar_rows.append({"metric": label, "score": agg_f.get(key, 0.0),  "method": "🔀 RAG Fusion"})
+            bar_rows.append({"metric": label, "score": agg_fl.get(key, 0.0), "method": "⚡ FLARE"})
+        bar_df = pd.DataFrame(bar_rows)
+        chart = (
+            alt.Chart(bar_df)
+            .mark_bar()
+            .encode(
+                x=alt.X("method:N", title=None, axis=alt.Axis(labelAngle=0)),
+                y=alt.Y("score:Q", scale=alt.Scale(domain=[0, 1]), title=t("分數", "Score")),
+                color=alt.Color("method:N", scale=alt.Scale(range=["#1a73e8", "#e8711a"]), legend=None),
+                column=alt.Column("metric:N", title=None),
+                tooltip=["method", "metric", alt.Tooltip("score:Q", format=".4f")],
             )
+            .properties(height=260, width=80)
+        )
+        st.altair_chart(chart)
 
-        with col2:
-            n_samples = st.number_input(
-                t("抽取筆數", "Sample Count"),
-                min_value=10,
-                max_value=500,
-                value=100,
-                step=10,
-                help=t("建議 50–150 筆，過多可能導致 Rate Limit", "Recommend 50–150; too many may hit rate limits"),
+    with tab_line:
+        line_rows = []
+        for s in results:
+            for label, key in METRIC_META:
+                line_rows.append({"idx": s.idx, "metric": label, "score": s.scores_fusion.get(key, 0.0), "method": "🔀 RAG Fusion"})
+                line_rows.append({"idx": s.idx, "metric": label, "score": s.scores_flare.get(key, 0.0),  "method": "⚡ FLARE"})
+        sel_metric = st.selectbox(t("顯示指標", "Metric"), [m for m, _ in METRIC_META])
+        line_df = pd.DataFrame([r for r in line_rows if r["metric"] == sel_metric])
+        lc = (
+            alt.Chart(line_df)
+            .mark_line(point=True, opacity=0.8)
+            .encode(
+                x=alt.X("idx:Q", title=t("樣本編號", "Sample Index")),
+                y=alt.Y("score:Q", scale=alt.Scale(domain=[0, 1]), title=sel_metric),
+                color=alt.Color("method:N", scale=alt.Scale(range=["#1a73e8", "#e8711a"])),
+                tooltip=["idx", "method", alt.Tooltip("score:Q", format=".4f")],
             )
+            .properties(height=300)
+            .interactive()
+        )
+        st.altair_chart(lc, use_container_width=True)
 
-        with col3:
-            use_bertscore = st.checkbox(
-                t("啟用 BERTScore", "Enable BERTScore"),
-                value=True,
-                help=t(
-                    "BERTScore 使用 distilbert-base-uncased 計算語意相似度，\n首次執行需下載模型（約 250MB）。",
-                    "BERTScore uses distilbert-base-uncased for semantic similarity.\nFirst run downloads ~250MB model.",
-                ),
-            )
+    with tab_table:
+        table_rows = []
+        for s in results:
+            row = {t("編號","Idx"): s.idx, t("標題","Title"): s.title[:50]}
+            for label, key in METRIC_META:
+                row[f"F_{label}"]  = s.scores_fusion.get(key, 0.0)
+                row[f"FL_{label}"] = s.scores_flare.get(key, 0.0)
+            table_rows.append(row)
+        tdf = pd.DataFrame(table_rows)
+        score_cols = [c for c in tdf.columns if c.startswith(("F_","FL_"))]
+        st.dataframe(
+            tdf.style.background_gradient(subset=score_cols, cmap="YlGn", vmin=0, vmax=1),
+            use_container_width=True,
+            height=420,
+        )
 
-        col4, col5 = st.columns(2)
-        with col4:
-            inference_delay = st.slider(
-                t("推論間隔（秒）", "Inference Delay (s)"),
-                min_value=0.0, max_value=5.0, value=0.5, step=0.1,
-                help=t("避免 API Rate Limit 的等待時間", "Delay between API calls to avoid rate limits"),
-            )
-        with col5:
-            st.markdown(f"**{t('當前後端', 'Current Backend')}:** `{provider.upper()}`")
+    with tab_detail:
+        sidx = st.selectbox(
+            t("樣本", "Sample"),
+            options=[s.idx for s in results],
+            format_func=lambda i: f"#{i}: {results[i].title[:55]}",
+        )
+        if sidx is not None:
+            s = results[sidx]
+            st.markdown(f"**{t('標題','Title')}:** {s.title}")
+            st.markdown(f"**{t('問題','Question')}:** {s.question}")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.markdown(f"**{t('Reference','Reference')}**")
+                st.text_area("ref_d", s.reference, height=180, label_visibility="collapsed", disabled=True)
+            with c2:
+                st.markdown("**🔀 RAG Fusion**")
+                st.text_area("pred_f_d", s.pred_fusion, height=180, label_visibility="collapsed", disabled=True)
+            with c3:
+                st.markdown("**⚡ FLARE**")
+                st.text_area("pred_fl_d", s.pred_flare, height=180, label_visibility="collapsed", disabled=True)
+            st.markdown(f"**{t('分數對比','Score Comparison')}**")
+            sc1, sc2 = st.columns(2)
+            with sc1:
+                st.caption("🔀 RAG Fusion")
+                for k, v in s.scores_fusion.items():
+                    st.metric(k, f"{v:.4f}")
+            with sc2:
+                st.caption("⚡ FLARE")
+                for k, v in s.scores_flare.items():
+                    fl_v = v
+                    fu_v = s.scores_fusion.get(k, 0.0)
+                    st.metric(k, f"{fl_v:.4f}", delta=f"{fl_v - fu_v:+.4f}")
 
-    # ── 載入資料集 ──────────────────────────────────────────────
-    load_col, run_col, export_col = st.columns([1, 1, 1])
-
-    with load_col:
-        if st.button(t("📥 載入資料集", "📥 Load Dataset"), type="secondary", use_container_width=True):
-            with st.spinner(t("正在從 HuggingFace 串流載入資料…", "Streaming from HuggingFace…")):
-                try:
-                    if dataset_choice == "CShorten/ML-ArXiv-Papers":
-                        rows = load_ml_arxiv_papers(n=int(n_samples))
-                    else:
-                        rows = load_arxiv_dataset(n=int(n_samples))
-
-                    st.session_state["eval_rows"]   = rows
-                    st.session_state["eval_samples"] = build_eval_samples(rows)
-                    st.session_state["eval_results"] = []
-                    st.session_state["eval_agg"]     = {}
-                    st.success(t(f"✅ 已載入 {len(rows)} 筆資料", f"✅ Loaded {len(rows)} records"))
-                    logger.info(f"[eval_page] 載入 {len(rows)} 筆，資料集={dataset_choice}")
-                except Exception as e:
-                    st.error(t(f"❌ 載入失敗：{e}", f"❌ Load failed: {e}"))
-                    logger.error(f"[eval_page] 載入失敗: {e}", exc_info=True)
-
-    # 資料集預覽
-    if "eval_samples" in st.session_state and st.session_state["eval_samples"]:
-        samples: List[EvalSample] = st.session_state["eval_samples"]
-
-        with st.expander(t(f"📋 資料預覽（前 5 筆，共 {len(samples)} 筆）", f"📋 Data Preview (first 5 of {len(samples)})"), expanded=False):
-            import pandas as pd
-            preview_df = pd.DataFrame([
-                {
-                    t("編號", "Idx"): s.idx,
-                    t("標題", "Title"): s.title[:80] + ("…" if len(s.title) > 80 else ""),
-                    t("問題", "Question"): s.question,
-                    t("摘要長度", "Abstract Len"): len(s.abstract),
-                }
-                for s in samples[:5]
-            ])
-            st.dataframe(preview_df, use_container_width=True)
-
-        # ── 執行推論 ────────────────────────────────────────────
-        with run_col:
-            run_btn = st.button(t("🚀 執行推論與評估", "🚀 Run Inference & Eval"), type="primary", use_container_width=True)
-
-        if run_btn:
-            progress_bar  = st.progress(0.0)
-            status_text   = st.empty()
-
-            # 推論
-            with st.status(t("🤖 LLM 推論中…", "🤖 Running LLM inference…"), expanded=True) as inf_status:
-                try:
-                    st.write(t(f"使用後端：{provider.upper()}，共 {len(samples)} 筆", f"Backend: {provider.upper()}, {len(samples)} samples"))
-                    samples = run_inference_on_samples(
-                        samples,
-                        provider=provider,
-                        progress_bar=progress_bar,
-                        status_text=status_text,
-                        delay_seconds=inference_delay,
-                    )
-                    st.session_state["eval_samples"] = samples
-                    inf_status.update(label=t("✅ 推論完成", "✅ Inference complete"), state="complete")
-                except Exception as e:
-                    inf_status.update(label=t(f"❌ 推論失敗：{e}", f"❌ Inference failed: {e}"), state="error")
-                    logger.error(f"[eval_page] 推論失敗: {e}", exc_info=True)
-                    st.stop()
-
-            # 評估
-            with st.status(t("📊 計算評估指標…", "📊 Computing evaluation metrics…"), expanded=True) as eval_status:
-                try:
-                    st.write(t(
-                        f"計算 ROUGE / BLEU / Exact Match" + (" / BERTScore" if use_bertscore else ""),
-                        f"Computing ROUGE / BLEU / Exact Match" + (" / BERTScore" if use_bertscore else ""),
-                    ))
-                    samples = compute_all_scores(samples, use_bertscore=use_bertscore)
-                    agg     = aggregate_scores(samples)
-                    st.session_state["eval_results"] = samples
-                    st.session_state["eval_agg"]     = agg
-                    eval_status.update(label=t("✅ 評估完成", "✅ Evaluation complete"), state="complete")
-                except Exception as e:
-                    eval_status.update(label=t(f"❌ 評估失敗：{e}", f"❌ Evaluation failed: {e}"), state="error")
-                    logger.error(f"[eval_page] 評估失敗: {e}", exc_info=True)
-
-            status_text.empty()
-            progress_bar.empty()
-
-    # ── 結果顯示 ────────────────────────────────────────────────
-    if st.session_state.get("eval_agg"):
-        agg     = st.session_state["eval_agg"]
-        results = st.session_state["eval_results"]
-
-        st.markdown("---")
-        st.subheader(t("📊 整體評估結果", "📊 Aggregate Evaluation Results"))
-
-        # 指標卡片
-        metric_cols = st.columns(5)
-        metric_meta = [
-            ("ROUGE-1 F1",     "rouge1_f",      "n-gram 精確率/召回率平衡"),
-            ("ROUGE-L F1",     "rougeL_f",      "最長公共子序列"),
-            ("BLEU-1",         "bleu1",         "1-gram 精確率（平滑）"),
-            ("Exact Match",    "exact_match",   "完全匹配比率"),
-            ("BERTScore F1",   "bertscore_f1",  "語意相似度"),
-        ]
-        for col, (label, key, _help) in zip(metric_cols, metric_meta):
-            val = agg.get(key, 0.0)
-            col.metric(label=label, value=f"{val:.4f}", help=_help)
-
-        # 分數分佈圖
-        import pandas as pd
-
-        scores_df = pd.DataFrame([
+    with tab_export:
+        st.markdown(t("匯出當次推論的完整結果。", "Export the full results of this run."))
+        export_data = [
             {
-                "idx":          s.idx,
-                "title":        s.title[:50],
-                "rouge1_f":     s.scores.get("rouge1_f", 0),
-                "rougeL_f":     s.scores.get("rougeL_f", 0),
-                "bleu1":        s.scores.get("bleu1", 0),
-                "bertscore_f1": s.scores.get("bertscore_f1", 0),
+                "idx": s.idx, "paper_id": s.paper_id, "title": s.title,
+                "question": s.question, "reference": s.reference,
+                "pred_fusion": s.pred_fusion, "scores_fusion": s.scores_fusion,
+                "pred_flare":  s.pred_flare,  "scores_flare":  s.scores_flare,
             }
             for s in results
-        ])
+        ]
+        st.download_button(
+            t("⬇️ 匯出 JSON", "⬇️ Export JSON"),
+            data=json.dumps(export_data, ensure_ascii=False, indent=2).encode(),
+            file_name="eval_results.json",
+            mime="application/json",
+        )
 
-        tab_chart, tab_table, tab_detail = st.tabs([
-            t("📈 分數分佈", "📈 Score Distribution"),
-            t("📋 詳細結果", "📋 Detailed Results"),
-            t("🔍 逐筆檢視", "🔍 Sample Inspection"),
-        ])
-
-        with tab_chart:
-            import altair as alt
-
-            chart_data = scores_df[["idx", "rouge1_f", "rougeL_f", "bleu1", "bertscore_f1"]].melt(
-                id_vars="idx", var_name="metric", value_name="score"
-            )
-            chart = (
-                alt.Chart(chart_data)
-                .mark_line(point=True, opacity=0.7)
-                .encode(
-                    x=alt.X("idx:Q", title=t("樣本編號", "Sample Index")),
-                    y=alt.Y("score:Q", title=t("分數", "Score"), scale=alt.Scale(domain=[0, 1])),
-                    color=alt.Color("metric:N", title=t("指標", "Metric")),
-                    tooltip=["idx", "metric", alt.Tooltip("score:Q", format=".4f")],
-                )
-                .properties(
-                    title=t("各樣本評估分數", "Per-Sample Evaluation Scores"),
-                    height=350,
-                )
-                .interactive()
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-            # 長條圖：平均分數
-            avg_df = pd.DataFrame([
-                {"metric": k, "avg_score": v}
-                for k, v in agg.items()
-            ])
-            bar = (
-                alt.Chart(avg_df)
-                .mark_bar(cornerRadiusTopLeft=4, cornerRadiusTopRight=4)
-                .encode(
-                    x=alt.X("metric:N", title=t("指標", "Metric"), sort=None),
-                    y=alt.Y("avg_score:Q", title=t("平均分數", "Avg Score"), scale=alt.Scale(domain=[0, 1])),
-                    color=alt.Color("metric:N", legend=None),
-                    tooltip=["metric", alt.Tooltip("avg_score:Q", format=".4f")],
-                )
-                .properties(title=t("各指標平均分數", "Average Score per Metric"), height=280)
-            )
-            st.altair_chart(bar, use_container_width=True)
-
-        with tab_table:
-            display_df = scores_df.rename(columns={
-                "idx": t("編號", "Idx"),
-                "title": t("標題", "Title"),
-                "rouge1_f": "ROUGE-1",
-                "rougeL_f": "ROUGE-L",
-                "bleu1": "BLEU-1",
-                "bertscore_f1": "BERTScore",
-            })
-            st.dataframe(
-                display_df.style.background_gradient(
-                    subset=["ROUGE-1", "ROUGE-L", "BLEU-1", "BERTScore"],
-                    cmap="YlGn", vmin=0, vmax=1
-                ),
-                use_container_width=True,
-                height=400,
-            )
-
-        with tab_detail:
-            sample_idx = st.selectbox(
-                t("選擇樣本編號", "Select Sample Index"),
-                options=[s.idx for s in results],
-                format_func=lambda i: f"#{i}: {results[i].title[:60]}…" if len(results[i].title) > 60 else f"#{i}: {results[i].title}",
-            )
-            if sample_idx is not None:
-                s = results[sample_idx]
-                st.markdown(f"**{t('標題', 'Title')}:** {s.title}")
-                st.markdown(f"**{t('問題', 'Question')}:** {s.question}")
-                st.markdown(f"**Paper ID:** `{s.paper_id}`")
-
-                c1, c2 = st.columns(2)
-                with c1:
-                    st.markdown(f"**{t('參考答案（摘要）', 'Reference (Abstract)')}**")
-                    st.text_area("ref", s.reference, height=200, label_visibility="collapsed", disabled=True)
-                with c2:
-                    st.markdown(f"**{t('LLM 推論輸出', 'LLM Prediction')}**")
-                    st.text_area("pred", s.prediction, height=200, label_visibility="collapsed", disabled=True)
-
-                st.markdown(f"**{t('評估分數', 'Scores')}**")
-                score_cols = st.columns(len(s.scores))
-                for col, (k, v) in zip(score_cols, s.scores.items()):
-                    col.metric(k, f"{v:.4f}")
-
-        # ── 匯出 ───────────────────────────────────────────────
-        with export_col:
-            import json, io
-            export_data = [
-                {
-                    "idx":        s.idx,
-                    "paper_id":   s.paper_id,
-                    "title":      s.title,
-                    "question":   s.question,
-                    "reference":  s.reference,
-                    "prediction": s.prediction,
-                    "scores":     s.scores,
-                }
-                for s in results
-            ]
-            json_bytes = json.dumps(export_data, ensure_ascii=False, indent=2).encode("utf-8")
-            st.download_button(
-                label=t("⬇️ 匯出 JSON 結果", "⬇️ Export JSON Results"),
-                data=json_bytes,
-                file_name="eval_results.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-
-            # CSV 匯出
-            csv_buf = io.StringIO()
-            scores_df.to_csv(csv_buf, index=False)
-            st.download_button(
-                label=t("⬇️ 匯出 CSV 分數", "⬇️ Export CSV Scores"),
-                data=csv_buf.getvalue().encode("utf-8"),
-                file_name="eval_scores.csv",
-                mime="text/csv",
-                use_container_width=True,
-            )
+        csv_rows = []
+        for s in results:
+            row = {"idx": s.idx, "title": s.title, "question": s.question}
+            for k, v in s.scores_fusion.items():
+                row[f"fusion_{k}"] = v
+            for k, v in s.scores_flare.items():
+                row[f"flare_{k}"] = v
+            csv_rows.append(row)
+        buf = io.StringIO()
+        pd.DataFrame(csv_rows).to_csv(buf, index=False)
+        st.download_button(
+            t("⬇️ 匯出 CSV", "⬇️ Export CSV"),
+            data=buf.getvalue().encode(),
+            file_name="eval_scores.csv",
+            mime="text/csv",
+        )

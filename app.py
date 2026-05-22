@@ -323,104 +323,236 @@ chosen_files = st.multiselect(
 
 # ── RAG method selection ──────────────────────────────────────────────────────
 
-from llm_helper import convert_message, get_rag_chain_files, get_rag_fusion_chain_files
+from llm_helper import convert_message, get_rag_fusion_chain_files, get_rag_fusion_flare_chain_files
 
-rag_method_map = {
-    t("基本 RAG", "Basic RAG"): get_rag_chain_files,
-    t("RAG Fusion（推薦）", "RAG Fusion (Recommended)"): get_rag_fusion_chain_files,
+# 兩種方法的設定
+RAG_METHODS = {
+    "fusion": {
+        "key":       "fusion",
+        "label_zh":  "🔀 RAG Fusion",
+        "label_en":  "🔀 RAG Fusion",
+        "icon":      "🔀",          # chat_message avatar
+        "color":     "#1a73e8",     # 藍
+        "history_key": "messages_fusion",
+        "chain_fn":  get_rag_fusion_chain_files,
+        "desc_zh":   "多查詢生成 + 倒數排名融合（RRF）",
+        "desc_en":   "Multi-query generation + Reciprocal Rank Fusion (RRF)",
+    },
+    "flare": {
+        "key":       "flare",
+        "label_zh":  "⚡ RAG Fusion + FLARE",
+        "label_en":  "⚡ RAG Fusion + FLARE",
+        "icon":      "⚡",
+        "color":     "#e8711a",     # 橘
+        "history_key": "messages_flare",
+        "chain_fn":  get_rag_fusion_flare_chain_files,
+        "desc_zh":   "RAG Fusion 初稿 → 不確定句偵測 → 迭代補充檢索精煉",
+        "desc_en":   "RAG Fusion draft → uncertain sentence detection → iterative retrieval refinement",
+    },
 }
 
-chosen_rag_method = st.radio(
-    t("選擇 RAG 方式", "Choose RAG Method"),
-    list(rag_method_map.keys()),
-    index=0,
-    horizontal=True,
-)
-get_rag_chain_func = rag_method_map[chosen_rag_method]
+# ── 頁籤切換 ──────────────────────────────────────────────────────────────────
 
-if not chosen_files:
-    st.info(t(
-        "💡 請先在左側欄下載 PDF、點選「嵌入所有 PDF 文件」，再選取文件後開始提問。",
-        "💡 Download a PDF via the sidebar, click 'Embed All PDF Documents', select files above, then start chatting.",
-    ))
+tab_fusion, tab_flare = st.tabs([
+    RAG_METHODS["fusion"]["label_zh" if LANG == "中文" else "label_en"],
+    RAG_METHODS["flare"]["label_zh"  if LANG == "中文" else "label_en"],
+])
 
-# ── Chat history ──────────────────────────────────────────────────────────────
+# 初始化各自獨立的對話歷史
+for m in RAG_METHODS.values():
+    if m["history_key"] not in st.session_state:
+        st.session_state[m["history_key"]] = []
 
-if "messages" not in st.session_state:
-    st.session_state.messages = []
 
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
+def _render_chat_tab(method: dict, tab_container):
+    """
+    渲染單一 RAG 方法的完整對話介面（含清除按鈕、歷史、輸入框）。
+    Renders a full chat UI for one RAG method inside a tab.
+    """
+    history_key = method["history_key"]
+    icon        = method["icon"]
+    color       = method["color"]
+    chain_fn    = method["chain_fn"]
+    is_flare    = method["key"] == "flare"
 
-# ── Chat input ────────────────────────────────────────────────────────────────
+    with tab_container:
+        # ── 說明 + 清除按鈕 ──────────────────────────────────
+        desc = method["desc_zh"] if LANG == "中文" else method["desc_en"]
+        hdr_col, clear_col = st.columns([5, 1])
+        hdr_col.caption(f"**{t('方法說明', 'Method')}：** {desc}")
 
-prompt = st.chat_input(t("輸入你的問題...", "Enter your question..."))
+        if clear_col.button(
+            t("🗑️ 清除記錄", "🗑️ Clear"),
+            key=f"clear_{method['key']}",
+            help=t(f"清除 {method['label_zh']} 的所有對話", f"Clear all messages for {method['label_en']}"),
+        ):
+            st.session_state[history_key] = []
+            st.rerun()
 
-if prompt:
-    if not chosen_files:
-        st.warning(t("⚠️ 請先選擇至少一個文件", "⚠️ Please select at least one file first"))
-        st.stop()
+        # ── 提示（尚未選文件）────────────────────────────────
+        if not chosen_files:
+            st.info(t(
+                "💡 請先在左側欄下載 PDF、點選「嵌入所有 PDF 文件」，再選取文件後開始提問。",
+                "💡 Download a PDF via the sidebar, click 'Embed All PDF Documents', select files above, then start chatting.",
+            ))
+            return
 
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
+        # ── 渲染歷史對話 ──────────────────────────────────────
+        for msg in st.session_state[history_key]:
+            role   = msg["role"]
+            avatar = icon if role == "assistant" else None
+            with st.chat_message(role, avatar=avatar):
+                st.markdown(msg["content"])
 
-    with st.chat_message("assistant"):
-        retrieval_container = st.container()
-        message_placeholder = st.empty()
+        # ── Chat input ────────────────────────────────────────
+        prompt = st.chat_input(
+            t("輸入你的問題...", "Enter your question..."),
+            key=f"chat_input_{method['key']}",
+        )
 
-        retrieval_status = retrieval_container.status(t("**🔍 正在檢索相關內容...**", "**🔍 Retrieving context...**"))
-        queried_questions: list[str] = []
-        rendered_questions: set[str] = set()
+        if not prompt:
+            return
 
-        def update_retrieval_status():
-            for q in queried_questions:
-                if q not in rendered_questions:
-                    rendered_questions.add(q)
-                    retrieval_status.markdown(f"\n\n`→ {q}`")
+        # 追加 user 訊息
+        st.session_state[history_key].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
 
-        def retrieval_cb(qs):
-            if isinstance(qs, list):
-                for q in qs:
-                    if q not in queried_questions:
-                        queried_questions.append(q)
-            return qs
+        # ── Assistant 回應 ────────────────────────────────────
+        with st.chat_message("assistant", avatar=icon):
+            retrieval_container = st.container()
+            message_placeholder = st.empty()
 
-        try:
-            custom_chain = get_rag_chain_func(chosen_files, retrieval_cb=retrieval_cb, provider=PROVIDER)
-        except Exception as e:
-            logger.error(f"[chain build] {e}", exc_info=True)
-            st.error(t(f"❌ 建立 RAG 鏈失敗：{e}", f"❌ Failed to build RAG chain: {e}"))
-            st.stop()
+            # 初次 RAG Fusion 檢索狀態框
+            retrieval_status = retrieval_container.status(
+                t("**🔍 RAG Fusion 多查詢檢索中...**", "**🔍 RAG Fusion multi-query retrieval...**")
+            )
+            queried_qs:   list[str] = []
+            rendered_qs:  set[str]  = set()
 
-        chat_history = [convert_message(m) for m in st.session_state.messages[:-1]]
+            # FLARE 補充檢索狀態框（僅 FLARE 使用）
+            flare_status = None
+            flare_qs:    list[str] = []
+            flare_rendered: set[str] = set()
 
-        full_response = ""
-        try:
-            for chunk in custom_chain.stream({"input": prompt, "chat_history": chat_history}):
-                if isinstance(chunk, dict):
-                    text = chunk.get("output", "") or chunk.get("content", "")
-                elif hasattr(chunk, "content"):
-                    text = chunk.content
+            if is_flare:
+                flare_status = retrieval_container.status(
+                    t("**⚡ FLARE 補充檢索準備中...**", "**⚡ FLARE iterative retrieval (standby)...**")
+                )
+
+            def update_retrieval_status():
+                for q in queried_qs:
+                    if q not in rendered_qs:
+                        rendered_qs.add(q)
+                        retrieval_status.markdown(f"`→ {q}`")
+
+            def update_flare_status():
+                if flare_status is None:
+                    return
+                for q in flare_qs:
+                    if q not in flare_rendered:
+                        flare_rendered.add(q)
+                        flare_status.markdown(f"`⚡ {q}`")
+
+            def retrieval_cb(qs):
+                if isinstance(qs, list):
+                    for q in qs:
+                        if q not in queried_qs:
+                            queried_qs.append(q)
+                return qs
+
+            def flare_cb(qs):
+                if isinstance(qs, list):
+                    for q in qs:
+                        if q not in flare_qs:
+                            flare_qs.append(q)
+                return qs
+
+            # 建立 chain
+            try:
+                chain_kwargs = dict(
+                    file_names=chosen_files,
+                    retrieval_cb=retrieval_cb,
+                    provider=PROVIDER,
+                )
+                if is_flare:
+                    chain_kwargs["flare_cb"] = flare_cb
+                custom_chain = chain_fn(**chain_kwargs)
+            except Exception as e:
+                logger.error(f"[chain build] {e}", exc_info=True)
+                st.error(t(f"❌ 建立 RAG 鏈失敗：{e}", f"❌ Failed to build RAG chain: {e}"))
+                return
+
+            chat_history = [
+                convert_message(m)
+                for m in st.session_state[history_key][:-1]
+            ]
+
+            full_response = ""
+            try:
+                if is_flare:
+                    # FLARE chain 以 invoke 執行（內部已迭代），再顯示結果
+                    if flare_status:
+                        flare_status.update(
+                            label=t("**⚡ FLARE 補充檢索進行中...**", "**⚡ FLARE iterative retrieval running...**"),
+                            state="running",
+                        )
+                    full_response = custom_chain.invoke(
+                        {"input": prompt, "chat_history": chat_history}
+                    )
+                    update_retrieval_status()
+                    update_flare_status()
+                    message_placeholder.markdown(full_response)
+                    retrieval_status.update(
+                        label=t("✅ RAG Fusion 檢索完成", "✅ RAG Fusion retrieval complete"),
+                        state="complete",
+                    )
+                    if flare_status:
+                        n_iter = len(flare_qs)
+                        flare_status.update(
+                            label=t(
+                                f"✅ FLARE 補充檢索完成（{n_iter} 個補充查詢）",
+                                f"✅ FLARE refinement done ({n_iter} extra queries)",
+                            ),
+                            state="complete",
+                        )
                 else:
-                    text = str(chunk)
+                    # RAG Fusion：支援 streaming
+                    for chunk in custom_chain.stream({"input": prompt, "chat_history": chat_history}):
+                        if isinstance(chunk, dict):
+                            text = chunk.get("output", "") or chunk.get("content", "")
+                        elif hasattr(chunk, "content"):
+                            text = chunk.content
+                        else:
+                            text = str(chunk)
+                        full_response += text
+                        message_placeholder.markdown(full_response + "▌")
+                        update_retrieval_status()
 
-                full_response += text
-                message_placeholder.markdown(full_response + "▌")
-                update_retrieval_status()
+                    retrieval_status.update(
+                        label=t("✅ RAG Fusion 檢索完成", "✅ RAG Fusion retrieval complete"),
+                        state="complete",
+                    )
+                    message_placeholder.markdown(full_response)
 
-            retrieval_status.update(label=t("✅ 檢索完成", "✅ Retrieval complete"), state="complete")
-            message_placeholder.markdown(full_response)
+            except Exception as e:
+                logger.error(f"[chain stream] {e}", exc_info=True)
+                retrieval_status.update(
+                    label=t("❌ 發生錯誤", "❌ Error occurred"), state="error"
+                )
+                if flare_status:
+                    flare_status.update(label=t("❌ 發生錯誤", "❌ Error"), state="error")
+                error_msg = t(f"❌ 發生錯誤：{e}", f"❌ Error: {e}")
+                message_placeholder.markdown(error_msg)
+                full_response = error_msg
 
-        except Exception as e:
-            logger.error(f"[chain stream] {e}", exc_info=True)
-            retrieval_status.update(label=t("❌ 發生錯誤", "❌ Error occurred"), state="error")
-            error_msg = t(f"❌ 發生錯誤：{e}", f"❌ Error: {e}")
-            message_placeholder.markdown(error_msg)
-            full_response = error_msg
+        st.session_state[history_key].append({"role": "assistant", "content": full_response})
 
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+
+# ── 渲染兩個頁籤 ──────────────────────────────────────────────────────────────
+
+_render_chat_tab(RAG_METHODS["fusion"], tab_fusion)
+_render_chat_tab(RAG_METHODS["flare"],  tab_flare)
 
 # ── Footer ────────────────────────────────────────────────────────────────────
 
