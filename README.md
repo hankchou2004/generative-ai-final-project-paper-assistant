@@ -61,7 +61,7 @@ Sidebar 可即時切換，不需重啟。Groq / OpenAI / Ollama 模式下 Vision
     ![RAG Fusion 介面](image/demo1.png)
 
 * **RAG Fusion + FLARE 雙階段檢索問答：**
-    ![RAG Fusion + FLARE 介面](image/demo2.jpg)
+    ![RAG Fusion + FLARE 介面](image/demo2.png)
 
 ### 4. HuggingFace 資料集推論與評估頁面（`eval_page.py`）
 
