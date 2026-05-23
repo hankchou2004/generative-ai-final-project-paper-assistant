@@ -20,7 +20,7 @@
 - **語意優先切塊**：偵測章節標題做切割邊界；Abstract / Conclusion 使用較大 chunk（1200 tokens），一般正文 800 tokens
 - **批次嵌入 + 429 重試**：Google Embedding 分批呼叫並實作指數退避，避免免費額度速率限制
 
-### 2. 四 Provider 切換（Google Gemini / Groq / OpenAI / Ollama）
+### 2. 四種 Provider 切換（Google Gemini / Groq / OpenAI / Ollama）
 
 原版綁定 OpenAI。本專案透過 `get_llm()` / `get_embedding_func()` 統一介面，支援：
 
@@ -41,7 +41,7 @@ Sidebar 可即時切換，不需重啟。Groq / OpenAI / Ollama 模式下 Vision
 
 ### 3. RAG Fusion + FLARE 雙模式問答（`llm_helper.py`、`app.py`）
 
-原版僅有 RAG Fusion。本專案新增 RAG Fusion + FLARE，兩種方法以獨立頁籤分開展示，對話記錄互不干擾：
+原版為 RAG+ RAG Fusion。本專案修改為 RAG Fusion + FLARE，兩種方法以獨立頁籤分開展示，對話記錄互不干擾：
 
 **RAG Fusion（🔀）**
 - 生成 4 個子查詢 → 各自檢索 → Reciprocal Rank Fusion 合併排序
