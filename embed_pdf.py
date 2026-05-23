@@ -42,6 +42,7 @@ import io
 import logging
 import os
 import re
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
@@ -728,7 +729,9 @@ def get_embedding_func(provider: str = None):
     Supported providers:
         "google"       → GoogleGenerativeAIEmbeddings (models/gemini-embedding-001)
         "groq"         → HuggingFaceEmbeddings (BAAI/bge-m3，本地，免費，支援中文)
-        "huggingface"  → HuggingFaceEmbeddings (sentence-transformers，與 groq 相同)
+        "huggingface"  → HuggingFaceEmbeddings (與 groq 相同)
+        "openai"       → OpenAIEmbeddings (text-embedding-3-small)
+        "ollama"       → OllamaEmbeddings (nomic-embed-text，本地)
 
     Note:
         "groq" 與 "huggingface" 都使用本地 HuggingFace Embedding，
@@ -745,7 +748,6 @@ def get_embedding_func(provider: str = None):
                 "GOOGLE_API_KEY 未設定。請在 .streamlit/secrets.toml 加入。\n"
                 "GOOGLE_API_KEY not set."
             )
-        # ✅ 修正：使用新版模型名稱 gemini-embedding-001（舊版 embedding-001 已棄用）
         return GoogleGenerativeAIEmbeddings(
             model="models/gemini-embedding-001",
             google_api_key=api_key,
@@ -753,11 +755,10 @@ def get_embedding_func(provider: str = None):
 
     elif p in ("groq", "huggingface"):
         # "groq" provider 的 LLM 用 Groq API，但 embedding 只能本地 HuggingFace
-        # "huggingface" 為舊版命名，兩者行為相同
         from langchain_community.embeddings import HuggingFaceEmbeddings
         model_name = os.getenv(
-            "HF_EMBED_MODEL",  # 與 llm_helper.py 保持一致
-            os.getenv("HF_EMBEDDING_MODEL", "BAAI/bge-m3"),  # 向後相容舊環境變數
+            "HF_EMBED_MODEL",
+            os.getenv("HF_EMBEDDING_MODEL", "BAAI/bge-m3"),
         )
         logger.debug(f"[embedding] HuggingFace model: {model_name}")
         return HuggingFaceEmbeddings(
@@ -766,10 +767,29 @@ def get_embedding_func(provider: str = None):
             encode_kwargs={"normalize_embeddings": True},
         )
 
+    elif p == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY 未設定。請在 .streamlit/secrets.toml 加入。\n"
+                "OPENAI_API_KEY not set."
+            )
+        embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+        logger.debug(f"[embedding] OpenAI model: {embed_model}")
+        return OpenAIEmbeddings(model=embed_model, api_key=api_key)
+
+    elif p == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+        embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+        base_url    = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        logger.debug(f"[embedding] Ollama model: {embed_model}, base_url: {base_url}")
+        return OllamaEmbeddings(model=embed_model, base_url=base_url)
+
     else:
         raise ValueError(
-            f"不支援的 provider: {p!r}。請使用 'google'、'groq' 或 'huggingface'。\n"
-            f"Unsupported provider: {p!r}. Use 'google', 'groq', or 'huggingface'."
+            f"不支援的 provider: {p!r}。請使用 'google'、'groq'、'openai' 或 'ollama'。\n"
+            f"Unsupported provider: {p!r}. Use 'google', 'groq', 'openai', or 'ollama'."
         )
 
 
@@ -791,7 +811,6 @@ def _embed_with_batches(chunks: list, embedding_func) -> "FAISS":
 
     使用指數退避：第 n 次重試等待 RETRY_BASE_DELAY * 2^(n-1) 秒。
     """
-    import time, re
     
 
     def _embed_texts_with_retry(texts: list) -> list:
@@ -824,7 +843,6 @@ def _embed_with_batches(chunks: list, embedding_func) -> "FAISS":
     index   = FAISS.from_embeddings(list(zip(texts_0, embs_0)), embedding_func, metadatas=metas_0)
 
     # 後續批次：逐批合併
-    import time
     for start in range(EMBED_BATCH_SIZE, total, EMBED_BATCH_SIZE):
         batch = chunks[start: start + EMBED_BATCH_SIZE]
         batch_num = start // EMBED_BATCH_SIZE + 1
@@ -988,21 +1006,24 @@ def embed_all_pdf_docs(
 
 
 def get_all_index_files() -> List[str]:
-    """取得所有已建立的 FAISS 索引名稱（不含副檔名）。"""
+    """
+    取得所有已建立的 FAISS 索引名稱（不含副檔名）。
+    若目錄不存在或尚無索引檔案，回傳空 list（不拋出例外）。
+    Returns a list of FAISS index names (without extension).
+    Returns empty list if the index directory doesn't exist or is empty.
+    """
     index_directory = "index"
     postfix = ".index.faiss"
 
     if not os.path.exists(index_directory):
-        raise FileNotFoundError(
-            f"索引目錄 '{index_directory}' 不存在，請先執行文件嵌入。"
-        )
+        logger.debug(f"[get_all_index_files] 索引目錄 '{index_directory}' 尚不存在，回傳空列表。")
+        return []
+
     index_files = [
         f.replace(postfix, "")
         for f in os.listdir(index_directory)
         if f.endswith(postfix)
     ]
-    if not index_files:
-        raise ValueError("index/ 目錄下沒有索引檔案，請先嵌入文件。")
 
     logger.debug(f"[get_all_index_files] 找到: {index_files}")
     return index_files

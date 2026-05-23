@@ -1,8 +1,8 @@
 """
 llm_helper.py - LLM 與 RAG 鏈輔助函式 / LLM & RAG Chain Helper
 
-支援多 Provider 切換：Google Gemini / Groq
-Supports multiple providers: Google Gemini / Groq
+支援多 Provider 切換：Google Gemini / Groq / OpenAI / Ollama (本地 Llama 3)
+Supports multiple providers: Google Gemini / Groq / OpenAI / Ollama (local Llama 3)
 """
 
 import os
@@ -22,15 +22,24 @@ from operator import itemgetter
 
 # ── Provider 設定 / Provider config ──────────────────────────────────────────
 
-# 可選值 / Possible values: "google" | "groq"
+# 可選值 / Possible values: "google" | "groq" | "openai" | "ollama"
 # 透過環境變數或 Streamlit session_state 控制
+# 注意：模組級快取，呼叫端應明確傳入 provider= 以確保即時性
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "google")
 
-# Groq 模型選項（免費，速度快）
-GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.3-70b-versatile")
+# 各 provider 預設模型（使用函式動態讀取，確保 sidebar 切換後生效）
+def _groq_model()   -> str: return os.getenv("GROQ_CHAT_MODEL",   "llama-3.3-70b-versatile")
+def _google_model() -> str: return os.getenv("GOOGLE_CHAT_MODEL",  "gemini-2.0-flash")
+def _openai_model() -> str: return os.getenv("OPENAI_CHAT_MODEL",  "gpt-4o-mini")
+def _ollama_model() -> str: return os.getenv("OLLAMA_CHAT_MODEL",  "llama3")
+def _ollama_url()   -> str: return os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
 
-# Google 模型選項
-GOOGLE_CHAT_MODEL = os.getenv("GOOGLE_CHAT_MODEL", "gemini-2.0-flash")
+# 向後相容的模組級常數（僅供外部直接引用，不在內部使用）
+GROQ_CHAT_MODEL   = os.getenv("GROQ_CHAT_MODEL",   "llama-3.3-70b-versatile")
+GOOGLE_CHAT_MODEL = os.getenv("GOOGLE_CHAT_MODEL",  "gemini-2.0-flash")
+OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL",  "gpt-4o-mini")
+OLLAMA_CHAT_MODEL = os.getenv("OLLAMA_CHAT_MODEL",  "llama3")
+OLLAMA_BASE_URL   = os.getenv("OLLAMA_BASE_URL",    "http://localhost:11434")
 
 
 # ── LLM factory ──────────────────────────────────────────────────────────────
@@ -42,10 +51,10 @@ def get_llm(temperature: float = 0.0, provider: str = None, model: str = None):
 
     Args:
         temperature: 生成溫度
-        provider: "google" 或 "groq"，None 則讀取 LLM_PROVIDER 環境變數
+        provider: "google" | "groq" | "openai" | "ollama"，None 則讀取環境變數
         model: 模型名稱，None 則使用各 provider 預設值
     """
-    p = provider or LLM_PROVIDER
+    p = provider or os.getenv("LLM_PROVIDER", "google")
 
     if p == "groq":
         from langchain_groq import ChatGroq
@@ -55,13 +64,28 @@ def get_llm(temperature: float = 0.0, provider: str = None, model: str = None):
                 "GROQ_API_KEY 未設定。請在 .streamlit/secrets.toml 加入 GROQ_API_KEY。\n"
                 "GROQ_API_KEY is not set. Please add it to .streamlit/secrets.toml."
             )
-        m = model or GROQ_CHAT_MODEL
+        m = model or _groq_model()
         logger.debug(f"[get_llm] Groq model={m}, temp={temperature}")
-        return ChatGroq(
-            model=m,
-            temperature=temperature,
-            api_key=api_key,
-        )
+        return ChatGroq(model=m, temperature=temperature, api_key=api_key)
+
+    elif p == "openai":
+        from langchain_openai import ChatOpenAI
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError(
+                "OPENAI_API_KEY 未設定。請在 .streamlit/secrets.toml 加入 OPENAI_API_KEY。\n"
+                "OPENAI_API_KEY is not set. Please add it to .streamlit/secrets.toml."
+            )
+        m = model or _openai_model()
+        logger.debug(f"[get_llm] OpenAI model={m}, temp={temperature}")
+        return ChatOpenAI(model=m, temperature=temperature, api_key=api_key)
+
+    elif p == "ollama":
+        from langchain_ollama import ChatOllama
+        m = model or _ollama_model()
+        base_url = _ollama_url()
+        logger.debug(f"[get_llm] Ollama model={m}, base_url={base_url}, temp={temperature}")
+        return ChatOllama(model=m, temperature=temperature, base_url=base_url)
 
     else:  # google (default)
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -71,7 +95,7 @@ def get_llm(temperature: float = 0.0, provider: str = None, model: str = None):
                 "GOOGLE_API_KEY 未設定。請在 .streamlit/secrets.toml 加入 GOOGLE_API_KEY。\n"
                 "GOOGLE_API_KEY is not set. Please add it to .streamlit/secrets.toml."
             )
-        m = model or GOOGLE_CHAT_MODEL
+        m = model or _google_model()
         logger.debug(f"[get_llm] Google Gemini model={m}, temp={temperature}")
         return ChatGoogleGenerativeAI(
             model=m,
@@ -90,8 +114,10 @@ def get_embedding_func(provider: str = None):
 
     Google  → GoogleGenerativeAIEmbeddings (gemini-embedding-001)
     Groq    → HuggingFaceEmbeddings (BAAI/bge-m3，本地，免費，支援中文)
+    OpenAI  → OpenAIEmbeddings (text-embedding-3-small)
+    Ollama  → OllamaEmbeddings (nomic-embed-text，本地)
     """
-    p = provider or LLM_PROVIDER
+    p = provider or os.getenv("LLM_PROVIDER", "google")
 
     if p == "groq":
         from langchain_community.embeddings import HuggingFaceEmbeddings
@@ -102,6 +128,22 @@ def get_embedding_func(provider: str = None):
             model_kwargs={"device": "cpu"},
             encode_kwargs={"normalize_embeddings": True},
         )
+
+    elif p == "openai":
+        from langchain_openai import OpenAIEmbeddings
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if not api_key:
+            raise ValueError("OPENAI_API_KEY 未設定。")
+        embed_model = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
+        logger.debug(f"[get_embedding_func] OpenAI embedding model={embed_model}")
+        return OpenAIEmbeddings(model=embed_model, api_key=api_key)
+
+    elif p == "ollama":
+        from langchain_ollama import OllamaEmbeddings
+        embed_model = os.getenv("OLLAMA_EMBED_MODEL", "nomic-embed-text")
+        base_url = _ollama_url()
+        logger.debug(f"[get_embedding_func] Ollama embedding model={embed_model}, base_url={base_url}")
+        return OllamaEmbeddings(model=embed_model, base_url=base_url)
 
     else:  # google
         from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -248,7 +290,7 @@ def get_rag_fusion_chain_files(
     provider: str = None,
 ):
     """RAG Fusion 鏈（多檔案，使用倒數排名融合）。"""
-    p = provider or LLM_PROVIDER
+    p = provider or os.getenv("LLM_PROVIDER", "google")
     logger.info(f"[get_rag_fusion_chain_files] provider={p}, 檔案: {file_names}")
     vectorstores = get_search_index(file_names, index_folder, provider=p)
     query_gen_chain = get_search_query_generation_chain(provider=p)
@@ -369,7 +411,7 @@ def get_rag_fusion_flare_chain_files(
         flare_cb:     FLARE 補充檢索回調（顯示不確定句子查詢）
         provider:     "google" | "groq"
     """
-    p = provider or LLM_PROVIDER
+    p = provider or os.getenv("LLM_PROVIDER", "google")
     logger.info(f"[get_rag_fusion_flare_chain_files] provider={p}, 檔案: {file_names}")
     vectorstores = get_search_index(file_names, index_folder, provider=p)
     query_gen_chain = get_search_query_generation_chain(provider=p)
