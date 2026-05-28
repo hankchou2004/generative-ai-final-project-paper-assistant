@@ -79,8 +79,6 @@ st.sidebar.markdown(f"### ⚙️ {t('AI 後端選擇', 'AI Backend')}")
 provider_options = {
     t("🔵 Google Gemini（預設）", "🔵 Google Gemini (Default)"): "google",
     t("🟠 Groq + 本地 Embedding", "🟠 Groq + Local Embedding"): "groq",
-    t("🟢 OpenAI", "🟢 OpenAI"): "openai",
-    t("🦙 本地 Ollama（Llama 3）", "🦙 Local Ollama (Llama 3)"): "ollama",
 }
 chosen_provider_label = st.sidebar.radio(
     t("選擇 LLM Provider", "Select LLM Provider"),
@@ -97,20 +95,6 @@ if PROVIDER == "groq":
         t(
             "**Groq 模式**\n- Chat：Llama 3.3 70B（免費、快速）\n- Embedding：BAAI/bge-m3（本地，支援中文）\n- Vision：不支援，改用 OCR",
             "**Groq Mode**\n- Chat: Llama 3.3 70B (free, fast)\n- Embedding: BAAI/bge-m3 (local, multilingual)\n- Vision: not supported, uses OCR instead",
-        )
-    )
-elif PROVIDER == "openai":
-    st.sidebar.info(
-        t(
-            "**OpenAI 模式**\n- Chat：GPT-4o mini（預設）\n- Embedding：text-embedding-3-small\n- Vision：不支援",
-            "**OpenAI Mode**\n- Chat: GPT-4o mini (default)\n- Embedding: text-embedding-3-small\n- Vision: not supported",
-        )
-    )
-elif PROVIDER == "ollama":
-    st.sidebar.info(
-        t(
-            "**Ollama 本地模式**\n- Chat：Llama 3（需先執行 `ollama run llama3`）\n- Embedding：nomic-embed-text（需先執行 `ollama pull nomic-embed-text`）\n- Vision：不支援\n- 無需 API Key",
-            "**Ollama Local Mode**\n- Chat: Llama 3 (run `ollama run llama3` first)\n- Embedding: nomic-embed-text (run `ollama pull nomic-embed-text` first)\n- Vision: not supported\n- No API key needed",
         )
     )
 else:
@@ -136,38 +120,6 @@ if PROVIDER == "groq":
     )
     os.environ["GROQ_CHAT_MODEL"] = chosen_groq_model
 
-# OpenAI 模型選擇
-elif PROVIDER == "openai":
-    openai_model_options = [
-        "gpt-4o-mini",
-        "gpt-4o",
-        "gpt-4-turbo",
-        "gpt-3.5-turbo",
-    ]
-    chosen_openai_model = st.sidebar.selectbox(
-        t("OpenAI 模型", "OpenAI Model"),
-        openai_model_options,
-        index=0,
-    )
-    os.environ["OPENAI_CHAT_MODEL"] = chosen_openai_model
-
-# Ollama 設定
-elif PROVIDER == "ollama":
-    ollama_base_url = st.sidebar.text_input(
-        t("Ollama 伺服器位址", "Ollama Server URL"),
-        value=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434"),
-        placeholder="http://localhost:11434",
-    )
-    os.environ["OLLAMA_BASE_URL"] = ollama_base_url
-
-    ollama_model_options = ["llama3", "llama3.1", "llama3.2", "llama3:70b"]
-    chosen_ollama_model = st.sidebar.selectbox(
-        t("Ollama 模型", "Ollama Model"),
-        ollama_model_options,
-        index=0,
-    )
-    os.environ["OLLAMA_CHAT_MODEL"] = chosen_ollama_model
-
 st.sidebar.markdown("---")
 
 # ── API Key 設定 ──────────────────────────────────────────────────────────────
@@ -182,9 +134,6 @@ if os.path.exists(secrets_path):
         if "GROQ_API_KEY" in st.secrets:
             os.environ["GROQ_API_KEY"] = st.secrets["GROQ_API_KEY"]
             debug_log(t("已從 secrets.toml 讀取 GROQ_API_KEY", "Loaded GROQ_API_KEY from secrets.toml"))
-        if "OPENAI_API_KEY" in st.secrets:
-            os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
-            debug_log(t("已從 secrets.toml 讀取 OPENAI_API_KEY", "Loaded OPENAI_API_KEY from secrets.toml"))
     except Exception as e:
         logger.warning(f"讀取 secrets.toml 失敗: {e}")
 
@@ -221,24 +170,6 @@ elif PROVIDER == "groq" and not os.getenv("GROQ_API_KEY", ""):
         st.warning(t("⚠️ 請在左側欄輸入 Groq API Key", "⚠️ Please enter your Groq API Key in the sidebar"))
         st.stop()
 
-elif PROVIDER == "openai" and not os.getenv("OPENAI_API_KEY", ""):
-    st.sidebar.markdown(
-        t(
-            "### 🔑 請輸入 OpenAI API Key\n前往 [platform.openai.com](https://platform.openai.com/api-keys) 取得。",
-            "### 🔑 Enter OpenAI API Key\nGet one at [platform.openai.com](https://platform.openai.com/api-keys).",
-        )
-    )
-    openai_key_input = st.sidebar.text_input(t("OpenAI API Key", "OpenAI API Key"), type="password", placeholder="sk-...")
-    if openai_key_input:
-        os.environ["OPENAI_API_KEY"] = openai_key_input
-        st.sidebar.success(t("✅ 金鑰已設定", "✅ API key set"))
-        st.rerun()
-    else:
-        st.warning(t("⚠️ 請在左側欄輸入 OpenAI API Key", "⚠️ Please enter your OpenAI API Key in the sidebar"))
-        st.stop()
-
-# Ollama 不需要 API key，但可以提示連線狀態
-
 
 # ── Utility functions ─────────────────────────────────────────────────────────
 
@@ -250,7 +181,7 @@ def extract_arxiv_links(readme_contents: str) -> list[str]:
 
 def get_readme_contents(repo_url: str) -> str | None:
     import requests
-    user_repo = repo_url.replace("https://github.com/", "")
+    user_repo = repo_url.replace("https://github.com/", "").removesuffix(".git")
     api_url = f"https://api.github.com/repos/{user_repo}/contents/README.md"
     try:
         resp = requests.get(api_url, timeout=10)
@@ -316,7 +247,7 @@ if PROVIDER == "google":
         ),
     )
 else:
-    st.sidebar.caption(t("ℹ️ 非 Google 模式下 Vision 不可用，圖表將改用 OCR 辨識。", "ℹ️ Vision unavailable in non-Google mode; OCR will be used instead."))
+    st.sidebar.caption(t("ℹ️ Groq 模式下 Vision 不可用，圖表將改用 OCR 辨識。", "ℹ️ Vision unavailable in Groq mode; OCR will be used instead."))
 
 if st.sidebar.button(t("🔄 嵌入所有 PDF 文件", "🔄 Embed All PDF Documents"), key="embed_docs"):
     with st.sidebar.status(t("正在嵌入...", "Embedding..."), expanded=True) as status:
@@ -324,28 +255,21 @@ if st.sidebar.button(t("🔄 嵌入所有 PDF 文件", "🔄 Embed All PDF Docum
             import embed_pdf
             results = embed_pdf.embed_all_pdf_docs(use_vision=use_vision, provider=PROVIDER)
             for fname, stats in results.items():
-                # 使用 .get() 進行安全取值，避免 KeyError
-                total_pages = stats.get('total_pages', stats.get('page_count', 0))
-                visual_elements = stats.get('visual_elements', 0)
-                text_chunks = stats.get('text_chunks', 0)
-                visual_chunks = stats.get('visual_chunks', 0)
-                total_chunks = stats.get('total_chunks', 0)
-
                 status.markdown(
                     t(
                         f"📄 {fname}："
-                        f"{total_pages} 頁，"
-                        f"{visual_elements} 個視覺元素，"
-                        f"{text_chunks} 個文字 chunks，"
-                        f"{visual_chunks} 個視覺 chunks，"
-                        f"共 {total_chunks} 個 chunks",
+                        f"{stats['total_pages']} 頁，"
+                        f"{stats['visual_elements']} 個視覺元素，"
+                        f"{stats['text_chunks']} 個文字 chunks，"
+                        f"{stats['visual_chunks']} 個視覺 chunks，"
+                        f"共 {stats['total_chunks']} 個 chunks",
 
                         f"📄 {fname}: "
-                        f"{total_pages} pages, "
-                        f"{visual_elements} visual elements, "
-                        f"{text_chunks} text chunks, "
-                        f"{visual_chunks} visual chunks, "
-                        f"{total_chunks} total chunks",
+                        f"{stats['total_pages']} pages, "
+                        f"{stats['visual_elements']} visual elements, "
+                        f"{stats['text_chunks']} text chunks, "
+                        f"{stats['visual_chunks']} visual chunks, "
+                        f"{stats['total_chunks']} total chunks",
                     )
                 )
             status.update(label=t("✅ 嵌入完成！", "✅ Embedding complete!"), state="complete")
@@ -373,18 +297,11 @@ if CURRENT_PAGE == "eval":
 
 # ── Main UI (Chat page) ───────────────────────────────────────────────────────
 
-_provider_display = {
-    "google": "Google Gemini",
-    "groq": "Groq (Llama)",
-    "openai": "OpenAI",
-    "ollama": "Ollama (Llama 3)",
-}
-
 st.title(t("🔎 PaperHelper：高效、精準地閱讀論文", "🔎 PaperHelper: Read Papers Efficiently & Accurately"))
 st.caption(
     t(
-        f"使用 RAG Fusion · 當前後端：{_provider_display.get(PROVIDER, PROVIDER)}",
-        f"Powered by RAG Fusion · Backend: {_provider_display.get(PROVIDER, PROVIDER)}",
+        f"使用 RAG Fusion · 當前後端：{'Google Gemini' if PROVIDER == 'google' else 'Groq (Llama)'}",
+        f"Powered by RAG Fusion · Backend: {'Google Gemini' if PROVIDER == 'google' else 'Groq (Llama)'}",
     )
 )
 
@@ -480,18 +397,18 @@ def _render_chat_tab(method: dict, tab_container):
             ))
             return
 
-        # ── Chat input（放在歷史渲染之前宣告，確保固定在底部）──
-        prompt = st.chat_input(
-            t("輸入你的問題...", "Enter your question..."),
-            key=f"chat_input_{method['key']}",
-        )
-
         # ── 渲染歷史對話 ──────────────────────────────────────
         for msg in st.session_state[history_key]:
             role   = msg["role"]
             avatar = icon if role == "assistant" else None
             with st.chat_message(role, avatar=avatar):
                 st.markdown(msg["content"])
+
+        # ── Chat input ────────────────────────────────────────
+        prompt = st.chat_input(
+            t("輸入你的問題...", "Enter your question..."),
+            key=f"chat_input_{method['key']}",
+        )
 
         if not prompt:
             return
@@ -642,7 +559,7 @@ _render_chat_tab(RAG_METHODS["flare"],  tab_flare)
 st.markdown("---")
 st.caption(
     t(
-        f"PaperHelper · 後端：{_provider_display.get(PROVIDER, PROVIDER)} + LangChain · 僅依據所選文件回答",
-        f"PaperHelper · Backend: {_provider_display.get(PROVIDER, PROVIDER)} + LangChain · Answers based only on selected documents",
+        f"PaperHelper · 後端：{'Google Gemini' if PROVIDER == 'google' else 'Groq (Llama)'} + LangChain · 僅依據所選文件回答",
+        f"PaperHelper · Backend: {'Google Gemini' if PROVIDER == 'google' else 'Groq (Llama)'} + LangChain · Answers based only on selected documents",
     )
 )
