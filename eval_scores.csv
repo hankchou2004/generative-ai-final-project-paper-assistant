@@ -1,0 +1,14 @@
+idx,title,question,fusion_bertscore_f1,fusion_rougeL_f,fusion_faithfulness,fusion_compression_ratio,fusion_latency_s,flare_bertscore_f1,flare_rougeL_f,flare_faithfulness,flare_compression_ratio,flare_latency_s
+0,Learning from compressed observations,What is the main contribution of this paper?,0.8571,0.3755,0.7037,0.54,0.809,0.8742,0.4286,0.7303,0.5933,1.043
+1,"Sensor Networks with Random Links: Topology Design for Distributed
+  Consensus",What problem does this paper address?,0.8179,0.226,0.825,0.3008,0.568,0.8324,0.3177,0.7909,0.4135,1.019
+2,The on-line shortest path problem under partial monitoring,What method or approach is proposed in this paper?,0.8237,0.2772,0.7703,0.2633,0.555,0.8523,0.4136,0.812,0.4164,1.305
+3,A neural network approach to ordinal regression,What are the key findings or results of this paper?,0.8988,0.505,0.8028,0.5504,0.507,0.8988,0.505,0.8028,0.5504,0.605
+4,Parametric Learning and Monte Carlo Optimization,What datasets or benchmarks are used in this paper?,0.7665,0.1654,0.3846,0.3299,0.696,0.7734,0.1942,0.4211,0.3858,1.201
+5,Preconditioned Temporal Difference Learning,What is the main contribution of this paper?,0.7986,0.3232,0.463,1.4211,0.592,0.8639,0.3636,0.4125,2.1053,1.093
+6,A Note on the Inapproximability of Correlation Clustering,What problem does this paper address?,0.767,0.202,0.623,0.2723,0.518,0.8525,0.2733,0.6944,0.4821,1.155
+7,"Joint universal lossy coding and identification of stationary mixing
+  sources",What method or approach is proposed in this paper?,0.8753,0.4845,0.6508,0.7,0.543,0.8919,0.4503,0.6196,1.0222,0.974
+8,Supervised Feature Selection via Dependence Estimation,What are the key findings or results of this paper?,0.9154,0.4815,0.7407,1.0658,0.473,0.9154,0.4815,0.7407,1.0658,0.588
+9,"Equivalence of LP Relaxation and Max-Product for Weighted Matching in
+  General Graphs",What datasets or benchmarks are used in this paper?,0.7771,0.1915,0.6786,0.2629,0.455,0.8076,0.2105,0.5851,0.4413,1.231
