@@ -297,13 +297,25 @@ def _build_samples(rows: List[dict]) -> List[EvalSample]:
 #  推論工具函式
 # ══════════════════════════════════════════════════════════════════
 
-def _prompt(sample: EvalSample, method_note: str) -> str:
+ANSWER_LENGTH_HINTS = {
+    "short": "1-2 sentences",
+    "medium": "2-4 sentences",
+    "long": "4-6 sentences",
+}
+
+
+def _answer_length_hint(answer_length: str) -> str:
+    return ANSWER_LENGTH_HINTS.get(answer_length, ANSWER_LENGTH_HINTS["medium"])
+
+
+def _prompt(sample: EvalSample, method_note: str, answer_length: str = "medium") -> str:
+    length_hint = _answer_length_hint(answer_length)
     return (
         f"You are a scientific paper assistant. {method_note}\n\n"
         f"Paper Title: {sample.title}\n\n"
         f"Abstract:\n{sample.abstract}\n\n"
         f"Question: {sample.question}\n\n"
-        f"Answer concisely based ONLY on the abstract above (2–4 sentences):"
+        f"Answer concisely based ONLY on the abstract above ({length_hint}):"
     )
 
 
@@ -397,6 +409,9 @@ def run_inference(
     delay: float,
     delay_unit: str = "second",        # "second" | "token" | "sentence"
     uncertain_threshold: float = 0.5,  # 僅 FLARE 使用
+    flare_top_k: int = 2,
+    answer_length: str = "medium",
+    temperature: float = 0.0,
     progress_bar=None,
     status_text=None,
 ) -> List[EvalSample]:
@@ -415,7 +430,7 @@ def run_inference(
     from llm_helper import get_llm
     from langchain_core.messages import HumanMessage
 
-    llm       = get_llm(temperature=0.0, provider=provider)
+    llm       = get_llm(temperature=temperature, provider=provider)
     total     = len(samples)
     prev_pred = ""
 
@@ -424,14 +439,14 @@ def run_inference(
         try:
             if method == "fusion":
                 # ── RAG Fusion：直接生成 ──────────────────────────
-                resp          = llm.invoke([HumanMessage(content=_prompt(s, ""))])
+                resp          = llm.invoke([HumanMessage(content=_prompt(s, "", answer_length))])
                 s.pred_fusion = resp.content.strip()
                 prev_pred     = s.pred_fusion
                 s.latency_fusion = round(time.perf_counter() - t_start, 3)
 
             else:
                 # ── FLARE Step 1：生成草稿 ────────────────────────
-                draft_resp = llm.invoke([HumanMessage(content=_prompt(s, ""))])
+                draft_resp = llm.invoke([HumanMessage(content=_prompt(s, "", answer_length))])
                 draft      = draft_resp.content.strip()
 
                 # ── FLARE Step 2：詞彙覆蓋率信心評分 ──────────────
@@ -448,7 +463,7 @@ def run_inference(
                     # 從 abstract 用 TF-IDF 找最相關句子，模擬 vector DB 查詢
                     extra_context_parts = []
                     for lcs in low_conf_sents:
-                        retrieved = _mini_retrieve(lcs, s.abstract, top_k=2)
+                        retrieved = _mini_retrieve(lcs, s.abstract, top_k=flare_top_k)
                         extra_context_parts.append(retrieved)
                     extra_context = " ".join(extra_context_parts)
 
@@ -466,7 +481,8 @@ def run_inference(
                         f"Previous draft answer:\n{draft}\n\n"
                         f"Question: {s.question}\n\n"
                         f"The draft may contain unsupported statements. "
-                        f"Using the full context above, write an improved, faithful answer (2–4 sentences):"
+                        f"Using the full context above, write an improved, faithful answer "
+                        f"({_answer_length_hint(answer_length)}):"
                     )
                     refined      = llm.invoke([HumanMessage(content=refine_prompt)])
                     s.pred_flare = refined.content.strip()
@@ -764,6 +780,11 @@ def render_eval_page(provider: str, t):
     # 批次預覽
     samples: Optional[List[EvalSample]] = st.session_state.get("eval_samples")
     if not samples:
+        with st.expander(t("🧭 自動尋找最佳參數", "🧭 Auto Tune Parameters"), expanded=False):
+            st.info(t(
+                "請先在上方載入資料批次。自動尋參會使用目前載入的同一批樣本進行比較。",
+                "Please load a dataset batch first. Auto tune compares configs using the currently loaded samples.",
+            ))
         st.info(t("請先載入資料集。", "Please load a dataset first."))
         return
 
@@ -851,6 +872,214 @@ def render_eval_page(provider: str, t):
 
         st.session_state["eval_results"] = working
         st.rerun()
+
+    # ── 自動尋參 ─────────────────────────────────────────────────
+    with st.expander(t("🧭 自動尋找最佳參數", "🧭 Auto Tune Parameters"), expanded=False):
+        st.caption(t(
+            "使用目前載入的同一批樣本，自動比較 RAG Fusion 與多組 FLARE 信心門檻。"
+            "此功能不會覆蓋上方手動推論的結果。",
+            "Use the currently loaded samples to compare RAG Fusion with multiple FLARE thresholds. "
+            "This will not overwrite the manual inference results above.",
+        ))
+
+        tune_c0, tune_c1 = st.columns([1, 2])
+        tune_methods = tune_c0.multiselect(
+            t("調參方法", "Methods"),
+            options=["fusion", "flare"],
+            default=["fusion", "flare"],
+            format_func=lambda x: {
+                "fusion": "RAG Fusion",
+                "flare": "RAG Fusion + FLARE",
+            }[x],
+            help=t(
+                "可只跑 Fusion、只跑 FLARE，或兩者一起比較。",
+                "Run Fusion only, FLARE only, or compare both.",
+            ),
+        )
+        tune_thresholds = tune_c1.multiselect(
+            t("FLARE 信心門檻", "FLARE Confidence Thresholds"),
+            options=[0.1, 0.3, 0.5, 0.7, 0.85, 0.95],
+            default=[0.3, 0.5, 0.7, 0.85],
+            disabled="flare" not in tune_methods,
+            help=t(
+                "每個門檻都會跑一次 FLARE；RAG Fusion 會自動作為 baseline。",
+                "Each threshold runs one FLARE trial; RAG Fusion is included as the baseline.",
+            ),
+        )
+
+        tune_c2, tune_c3, tune_c4, tune_c5 = st.columns([1, 1, 1, 1])
+        tune_top_ks = tune_c2.multiselect(
+            t("FLARE top_k", "FLARE top_k"),
+            options=[1, 2, 3, 5],
+            default=[2],
+            disabled="flare" not in tune_methods,
+            help=t(
+                "每個不確定句會補充檢索幾個最相關句子。",
+                "How many related sentences to retrieve for each uncertain sentence.",
+            ),
+        )
+        tune_answer_lengths = tune_c3.multiselect(
+            t("回答長度", "Answer Length"),
+            options=["short", "medium", "long"],
+            default=["medium"],
+            format_func=lambda x: {
+                "short": t("短：1-2 句", "Short: 1-2 sentences"),
+                "medium": t("中：2-4 句", "Medium: 2-4 sentences"),
+                "long": t("長：4-6 句", "Long: 4-6 sentences"),
+            }[x],
+        )
+        tune_temperatures = tune_c4.multiselect(
+            "Temperature",
+            options=[0.0, 0.2, 0.5],
+            default=[0.0],
+            help=t(
+                "0.0 較穩定；較高 temperature 可能更有彈性，但變異較大。",
+                "0.0 is more deterministic; higher temperatures may be more flexible but less stable.",
+            ),
+        )
+        tune_objective = tune_c5.selectbox(
+            t("最佳化目標", "Optimization Objective"),
+            options=["balanced", "accuracy", "faithfulness", "speed"],
+            format_func=lambda x: {
+                "balanced": t("平衡", "Balanced"),
+                "accuracy": t("準確度", "Accuracy"),
+                "faithfulness": t("忠實度", "Faithfulness"),
+                "speed": t("速度", "Speed"),
+            }[x],
+        )
+
+        tune_c6, tune_c7 = st.columns([1, 2])
+        tune_max_samples = tune_c6.number_input(
+            t("尋參樣本上限", "Max Tune Samples"),
+            min_value=1,
+            max_value=len(samples),
+            value=min(10, len(samples)),
+            step=1,
+            help=t(
+                "建議先用少量樣本快速尋參，確認後再用完整批次正式評估。",
+                "Start with a small sample count for quick tuning, then evaluate the best config on the full batch.",
+            ),
+        )
+        n_fusion = (
+            len(tune_answer_lengths) * len(tune_temperatures)
+            if "fusion" in tune_methods else 0
+        )
+        n_flare = (
+            len(tune_thresholds) * len(tune_top_ks) * len(tune_answer_lengths) * len(tune_temperatures)
+            if "flare" in tune_methods else 0
+        )
+        total_configs = n_fusion + n_flare
+        tune_c7.caption(t(
+            f"預計執行 {total_configs} 組設定 × {int(tune_max_samples)} 筆樣本。",
+            f"Will run {total_configs} configs × {int(tune_max_samples)} samples.",
+        ))
+
+        tune_btn = st.button(
+            t("🔎 開始自動尋參", "🔎 Start Auto Tune"),
+            type="secondary",
+            disabled=(
+                not tune_methods
+                or not tune_answer_lengths
+                or not tune_temperatures
+                or ("flare" in tune_methods and (not tune_thresholds or not tune_top_ks))
+            ),
+            use_container_width=True,
+        )
+
+        if tune_btn:
+            from auto_tune import run_auto_tune
+
+            cfg = st.session_state.get("_eval_cfg", {})
+            _delay = cfg.get("delay", 0.5)
+            _delay_unit = cfg.get("delay_unit", "second")
+            _use_bertscore = cfg.get("use_bertscore", True)
+
+            tune_progress = st.progress(0.0, text=t("準備自動尋參…", "Preparing auto tune…"))
+            tune_status_text = st.empty()
+
+            def _tune_progress(event: dict):
+                total = max(event.get("total", 1), 1)
+                idx = event.get("index", 1)
+                method = event.get("method", "")
+                threshold = event.get("threshold")
+                top_k = event.get("flare_top_k")
+                answer_length = event.get("answer_length")
+                temperature = event.get("temperature")
+                if method == "fusion":
+                    label = f"RAG Fusion length={answer_length}, temp={temperature}"
+                else:
+                    label = f"FLARE threshold={threshold}, top_k={top_k}, length={answer_length}, temp={temperature}"
+                if event.get("event") == "start":
+                    tune_progress.progress((idx - 1) / total, text=t(
+                        f"執行 {idx}/{total}：{label}",
+                        f"Running {idx}/{total}: {label}",
+                    ))
+                    tune_status_text.caption(t(
+                        f"目前設定：{label}",
+                        f"Current config: {label}",
+                    ))
+                else:
+                    tune_progress.progress(idx / total, text=t(
+                        f"完成 {idx}/{total}：{label}",
+                        f"Done {idx}/{total}: {label}",
+                    ))
+
+            try:
+                with st.status(t("🧭 自動尋參執行中", "🧭 Auto tuning"), expanded=False) as st_tune:
+                    leaderboard = run_auto_tune(
+                        samples=samples,
+                        provider=provider,
+                        thresholds=tune_thresholds,
+                        methods=tune_methods,
+                        flare_top_ks=tune_top_ks,
+                        answer_lengths=tune_answer_lengths,
+                        temperatures=tune_temperatures,
+                        objective=tune_objective,
+                        delay=_delay,
+                        delay_unit=_delay_unit,
+                        use_bertscore=_use_bertscore,
+                        max_samples=int(tune_max_samples),
+                        progress_callback=_tune_progress,
+                    )
+                    st.session_state["auto_tune_leaderboard"] = leaderboard
+                    st_tune.update(label=t("✅ 自動尋參完成", "✅ Auto tune complete"), state="complete")
+            except Exception as e:
+                st.session_state["auto_tune_leaderboard"] = []
+                st.error(t(f"❌ 自動尋參失敗：{e}", f"❌ Auto tune failed: {e}"))
+            finally:
+                tune_progress.empty()
+                tune_status_text.empty()
+
+        leaderboard = st.session_state.get("auto_tune_leaderboard", [])
+        if leaderboard:
+            tune_df = pd.DataFrame(leaderboard)
+            best = leaderboard[0]
+            best_threshold = best.get("uncertain_threshold")
+            if best.get("method") == "fusion":
+                best_method = (
+                    f"RAG Fusion, length={best.get('answer_length')}, "
+                    f"temp={best.get('temperature')}"
+                )
+            else:
+                best_method = (
+                    f"FLARE threshold={best_threshold}, top_k={best.get('flare_top_k')}, "
+                    f"length={best.get('answer_length')}, temp={best.get('temperature')}"
+                )
+            st.success(t(
+                f"推薦最佳設定：{best_method}，Auto Score = {best.get('auto_score', 0.0):.4f}",
+                f"Recommended config: {best_method}, Auto Score = {best.get('auto_score', 0.0):.4f}",
+            ))
+            st.dataframe(tune_df, use_container_width=True, height=260)
+
+            tune_buf = io.StringIO()
+            tune_df.to_csv(tune_buf, index=False)
+            st.download_button(
+                t("⬇️ 匯出自動尋參 CSV", "⬇️ Export Auto Tune CSV"),
+                data=tune_buf.getvalue().encode(),
+                file_name="auto_tune_leaderboard.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     # ── 結果顯示 ─────────────────────────────────────────────────
     results: Optional[List[EvalSample]] = st.session_state.get("eval_results")
